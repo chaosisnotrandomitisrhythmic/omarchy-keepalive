@@ -343,6 +343,30 @@ Panel {
     return out
   }
 
+  // local patch: mirror Herdr's workspace > tab > pane order. Rows sort by
+  // workspace number, then tab number, then the section's own order
+  // (Array.sort is stable); a heading marks each workspace's first row.
+  function herdrKey(s) {
+    var h = s && s.herdr ? s.herdr : null
+    return h ? [Number(h.workspace_n || 999), Number(h.tab_n || 999)] : [1000, 1000]
+  }
+  function groupByHerdr(list) {
+    list.sort(function(a, b) {
+      var ka = root.herdrKey(a), kb = root.herdrKey(b)
+      return ka[0] !== kb[0] ? ka[0] - kb[0] : ka[1] - kb[1]
+    })
+    return list
+  }
+  function groupLabelAt(rows, i, title) {
+    if (title === "NEEDS YOU" || title === "DONE TODAY") return ""
+    var s = rows[i], h = s && s.herdr ? s.herdr : null
+    var label = h && h.workspace ? String(h.workspace) : "other"
+    var prev = i > 0 && rows[i - 1].herdr && rows[i - 1].herdr.workspace ? String(rows[i - 1].herdr.workspace) : (i > 0 ? "other" : null)
+    if (prev === label) return ""
+    var any = rows.some(function(r) { return r.herdr && r.herdr.workspace })
+    return any ? label : ""
+  }
+
   // 1. Needs you: blocked, waiting; the longest-neglected session leads.
   function needsYouSessions() {
     var list = root.allSessions.filter(function(s) {
@@ -360,7 +384,7 @@ Panel {
   function orphanedSessions() {
     var list = root.allSessions.filter(function(s) { return s.status && s.status.state === "orphaned" })
     list.sort(function(a, b) { return root.sinceMs(b) - root.sinceMs(a) })
-    return list
+    return root.groupByHerdr(list)
   }
 
   // 3. Working: starting, working, idle. Most recently changed first.
@@ -368,7 +392,7 @@ Panel {
     var states = { starting: true, working: true, idle: true }
     var list = root.allSessions.filter(function(s) { return s.status && states[s.status.state] && !s.attention_lane && s.att_state !== "suggested" })
     list.sort(function(a, b) { return root.sinceMs(b) - root.sinceMs(a) })
-    return list
+    return root.groupByHerdr(list)
   }
 
   // 4. Paused: a live session with no process, newest pause first, and no
@@ -376,7 +400,7 @@ Panel {
   function pausedSessions() {
     var list = root.allSessions.filter(function(s) { return s.status && s.status.state === "paused" })
     list.sort(function(a, b) { return root.sinceMs(b) - root.sinceMs(a) })
-    return list
+    return root.groupByHerdr(list)
   }
 
   // 5. Done today: done, failed, stopped in the last 24 h, newest first.
@@ -699,8 +723,17 @@ Panel {
     root.runAction(id, "preview", ["omarchy-agent-session-preview", String(id), "--focus"], "")
   }
 
-  function stopSession(id, lane) {
+  // local patch: closing a live Claude session runs /close-session inside
+  // it (anamnesis summary, then it closes its own pane). Never a kill first:
+  // the summary has to come from the session itself, not the API.
+  function closesInSession(s) {
+    return s && s.agent && s.agent.kind === "claude" && s.status
+      && (s.status.state === "working" || s.status.state === "idle" || s.status.state === "blocked" || s.status.state === "waiting")
+  }
+
+  function stopSession(id, lane, hard) {
     if (!id) return
+    if (!lane && !hard && root.closesInSession(root.sessionById(id))) { root.closeSession(id); return }
     var argv = ["omarchy-agent-session-stop", String(id)]
     if (lane) argv.push("--lane", String(lane))
     else { var next = Object.assign({}, root.stoppingIds); next[String(id)] = Date.now(); root.stoppingIds = next }
@@ -710,6 +743,14 @@ Panel {
   // Pause: one press, no confirmation, because it is reversible
   // (03-sessions-panel.md, 2026-09-03). A lane under the cursor pauses
   // the lane alone.
+  // local patch: `c` asks the agent to run /close-session, which saves
+  // the anamnesis summary and closes its own pane.
+  function closeSession(id) {
+    if (!id) return
+    root.armedStopId = ""
+    root.runAction(id, "close", ["omarchy-agent-session-core", "close", String(id)], "closing…")
+  }
+
   function pauseSession(id, lane) {
     if (!id) return
     var argv = ["omarchy-agent-session-pause", String(id)]
@@ -736,8 +777,9 @@ Panel {
     // Detached on purpose: omarchy-launch-tui blocks until the terminal it
     // launched exits (evaluation run 1, 2026-09-02), so a Process here
     // would hold the panel open on "opening…" until the pager closed.
+    // local patch: the anamnesis summary, falling back to the receipt
     Quickshell.execDetached(["omarchy-launch-tui", "--app-id=org.omarchy.session-receipt",
-                             "omarchy-agent-session-receipt", "--pager", String(id)])
+                             "keepalive-summary", String(id)])
     root.close()
   }
 
@@ -834,7 +876,7 @@ Panel {
     if (root.sendOpenId !== "") return "⏎ sends · esc cancels"
     if (root.armedStopId !== "") {
       var s = root.sessionById(root.armedStopId)
-      return "x again stops " + (s ? s.name : "it") + " · esc cancels"
+      return (root.closesInSession(s) ? "x again runs /close-session in " : "x again stops ") + (s ? s.name : "it") + " · esc cancels"
     }
     // Fits 400 px at the default font; `r` (receipt) works on every row
     // and the ended rows' own button says so, so it stays off the legend.
@@ -845,7 +887,7 @@ Panel {
     // today header, and esc closes every panel, so they give way first.
     var cur = root.selectedSession
     var hasSugg = cur && Array.isArray(cur.suggestions) && cur.suggestions.length > 0
-    var parts = hasSugg ? ["↑↓ move", "y accept", "d dismiss", "s send", "x stop"] : ["↑↓ move", "⏎ open", "s send", "x stop", "n new"]
+    var parts = hasSugg ? ["↑↓ move", "y accept", "d dismiss", "s send", "x stop"] : ["↑↓ move", "⏎ open", "s send", "x close", "z pause"]
     var curLive = cur && cur.status && !root.sessionEnded(cur) && cur.status.state !== "orphaned"
     if (cur && Array.isArray(cur.lanes) && cur.lanes.length > 0) parts.push("w lane")
     else if (curLive) parts.push("a add")
@@ -965,6 +1007,9 @@ Panel {
           root.armedStopId = ""
           root.sendOpenId = ""
           root.addOpenId = s.id
+        } else if (t === "c" || t === "C") {
+          if (ended || s.status.state === "orphaned" || s.status.state === "paused" || root.selectedLane) return
+          root.closeSession(s.id)
         } else if (t === "z" || t === "Z") {
           // Pause, one press (03-sessions-panel.md). Live or orphaned rows;
           // a lane under the cursor pauses that lane.
@@ -1264,6 +1309,7 @@ Panel {
                     fontFamily: root.fontFamily
                     nowMs: root.nowMs
                     formatAge: root.formatDuration
+                    groupLabel: root.groupLabelAt(parent.modelData.rows, index, parent.modelData.title)
 
                     onHasCursorChanged: if (hasCursor) root.ensureVisible(sessionRow)
                     onHoverRequested: function(id) { root.setCursor(id, false) }

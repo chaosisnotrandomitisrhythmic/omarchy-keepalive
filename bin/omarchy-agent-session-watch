@@ -366,12 +366,59 @@ def get_active_window() -> Optional[dict]:
     if not text:
         return None
     try:
-        return json.loads(text)
+        window = json.loads(text)
     except json.JSONDecodeError:
         return None
+    # local patch (2026-10-05): sessions are shown inside the one Herdr
+    # window, so the window alone no longer says which session is on screen.
+    if isinstance(window, dict) and window_hosts_herdr(window.get("pid")):
+        window["herdr_focused_panes"] = herdr_focused_panes()
+    return window
 
 
-def is_session_focused(session_id: str, window: Optional[dict]) -> bool:
+def window_hosts_herdr(window_pid) -> bool:
+    """Local patch: True when a local Herdr client (a bare `herdr`, or one on
+    a named session) runs under the window's process."""
+    if not isinstance(window_pid, int) or window_pid <= 1:
+        return False
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            argv = (proc / "cmdline").read_bytes().split(b"\0")[:-1]
+            if not argv or os.path.basename(argv[0]) != b"herdr":
+                continue
+            rest = [a.decode("utf-8", "replace") for a in argv[1:]]
+            if rest and rest[0] != "--session" and rest[:2] != ["session", "attach"]:
+                continue  # the server, a --remote client, or an api/agent helper
+            pid = int(proc.name)
+            while pid > 1:
+                if pid == window_pid:
+                    return True
+                pid = int((Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return False
+
+
+def herdr_focused_panes() -> list:
+    """Local patch: the pane ids Herdr reports as focused; empty when Herdr
+    cannot be asked, which degrades to "never suppress"."""
+    socket_path = os.environ.get("HERDR_SOCKET", os.path.expanduser("~/.config/herdr/herdr.sock"))
+    if not socket_path:
+        return []
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            sock.connect(socket_path)
+            request = {"id": "omarchy-agent-session-watch-focus", "method": "agent.list", "params": {}}
+            sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+            reply = json.loads(sock.makefile("r", encoding="utf-8").readline() or "{}")
+    except (OSError, ValueError):
+        return []
+    agents = (reply.get("result") or {}).get("agents") or []
+    return [a.get("pane_id") for a in agents if a.get("focused") and a.get("pane_id")]
+
+
+def is_session_focused(session_id: str, window: Optional[dict], record: Optional[dict] = None) -> bool:
     """VERIFY ON RIG: exact JSON field for the window's app id. Hyprland's
     activewindow has historically used "class" or "initialClass" depending on
     version; checked in that order, falling back to a literal "app_id" key in
@@ -379,7 +426,12 @@ def is_session_focused(session_id: str, window: Optional[dict]) -> bool:
     if not window:
         return False
     app_id = window.get("initialClass") or window.get("class") or window.get("app_id")
-    return app_id == f"{APP_ID_PREFIX}{session_id}"
+    if app_id == f"{APP_ID_PREFIX}{session_id}":
+        return True
+    # local patch (2026-10-05): the Herdr window is focused and the session's
+    # pane is the one focused inside it.
+    pane_id = ((record or {}).get("runtime") or {}).get("pane_id")
+    return bool(pane_id) and pane_id in (window.get("herdr_focused_panes") or [])
 
 
 def is_fullscreen(window: Optional[dict]) -> bool:
@@ -548,7 +600,7 @@ class SessionWatcher:
         # event never counts toward the digest tally either -- if the user is
         # already looking at exactly what it would announce, it generated no
         # interruption debt at all (spec/06-notifications.md's rationale).
-        if is_session_focused(session_id, window):
+        if is_session_focused(session_id, window, record):
             return
 
         headline = render_text(kind, record, event, self._lookup_name)

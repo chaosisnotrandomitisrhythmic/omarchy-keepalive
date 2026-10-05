@@ -79,7 +79,7 @@ TERMINAL_STATES = {"done", "failed", "stopped"}
 NEEDS_ATTENTION_STATES = {"waiting", "blocked"}
 
 EVENT_TYPES = (
-    "session.created", "session.renamed", "owner.assigned", "mode.changed",
+    "session.created", "close.requested", "session.renamed", "owner.assigned", "mode.changed",
     "preview.set", "runtime.bound", "runtime.unbound", "status.changed",
     "goal.set", "instruction.queued", "instruction.delivered",
     "instruction.dropped", "child.spawned", "child.completed",
@@ -1747,6 +1747,9 @@ def build_parser():
     p.add_argument("--lane", help="stop one lane only")
     p.add_argument("--reason")
 
+    p = sub.add_parser("close", help="local patch: ask the agent to run /close-session (anamnesis summary, self-close)")
+    add_id_arg(p)
+
     p = sub.add_parser("pause", help="I'll be back: exit the harness, keep the session, resume it later with open")
     add_id_arg(p)
     p.add_argument("--lane", help="pause one lane only")
@@ -1873,7 +1876,10 @@ def session_list_entry(s):
         # (02-command-surface.md, 2026-09-03).
         "revivable": session_revivable(s),
         "created_by": {"kind": created_by.get("kind"), "label": created_by.get("label")},
-        "project": session_project(s),
+        "project": (" › ".join(x for x in ((s.get("herdr_place") or {}).get("workspace"), (s.get("herdr_place") or {}).get("tab")) if x)
+                    or session_project(s)),
+        "herdr": s.get("herdr_place"),
+        "harness_ref": ref if isinstance(ref, str) else None,
         # 09-closed-loop-surfaces.md section 7: the registered preview and
         # the loop count ("<n> instructions, <m> captures").
         "preview": s.get("preview"),
@@ -2155,7 +2161,7 @@ def cmd_accept(args, ctx):
 PRESENCE_TTL_S = 600
 
 
-ADOPT_GRACE_S = 10
+ADOPT_GRACE_S = 10  # local patch (2026-10-04): adoption back on, made safe below
 
 
 def adopt_grace_seconds():
@@ -2923,6 +2929,53 @@ def restore_worktree_if_missing(session):
     return True
 
 
+def herdr_window_address():
+    """Local patch: the Hyprland window showing the local Herdr client (a
+    bare `herdr`, or one on a named session), found by walking each client
+    process up to a window's pid. None when there is no such window."""
+    try:
+        clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True,
+                                            text=True, timeout=3).stdout or "[]")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+    windows = {c.get("pid"): c.get("address") for c in clients if c.get("address")}
+    for proc in pathlib.Path("/proc").glob("[0-9]*"):
+        try:
+            argv = (proc / "cmdline").read_bytes().split(b"\0")[:-1]
+            if not argv or os.path.basename(argv[0]) != b"herdr":
+                continue
+            rest = [a.decode("utf-8", "replace") for a in argv[1:]]
+            if rest and rest[0] != "--session" and rest[:2] != ["session", "attach"]:
+                continue  # the server, a --remote client, or an api/agent helper
+            pid = int(proc.name)
+            while pid > 1:
+                if pid in windows:
+                    return windows[pid]
+                pid = int((pathlib.Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return None
+
+
+def focus_in_herdr_window(herdr, target):
+    """Local patch: show the agent where the person already works. True when
+    Herdr focused the agent and its window was raised."""
+    address = herdr_window_address()
+    if not address:
+        return False
+    try:
+        herdr.call("agent.focus", {"target": target})
+    except (HerdrError, HerdrUnavailable):
+        return False
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        done = subprocess.run(["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{address}" }})'],
+                              capture_output=True, text=True, timeout=3)
+        if done.returncode != 0 or "ok" not in done.stdout.lower():
+            subprocess.run(["hyprctl", "dispatch", "focuswindow", f"address:{address}"],
+                           capture_output=True, timeout=3)
+    return True
+
+
 def cmd_open(args, ctx):
     session = ctx.store.load(args.id_or_name)
     if getattr(args, "lane", None):
@@ -2999,11 +3052,15 @@ def cmd_open(args, ctx):
         # Detached: the launcher execs the terminal and only returns when the
         # window closes, which blocked `open` for the window's lifetime
         # (rig, 2026-09-02).
-        with contextlib.suppress(FileNotFoundError, OSError):
-            subprocess.Popen(["omarchy-launch-or-focus-tui", f"--app-id=org.omarchy.session.{session['id']}",
-                              "herdr", "agent", "attach", alias],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True)
+        # local patch (2026-10-05): stay in Herdr. With a Herdr window on
+        # the desktop, focus the agent inside it; a terminal of its own is
+        # only the fallback for when no Herdr client is open.
+        if not focus_in_herdr_window(ctx.herdr, runtime.get("agent_id") or alias):
+            with contextlib.suppress(FileNotFoundError, OSError):
+                subprocess.Popen(["omarchy-launch-or-focus-tui", f"--app-id=org.omarchy.session.{session['id']}",
+                                  "herdr", "agent", "attach", alias],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
         # Instructions queued while the session had no runtime ("delivered
         # on revive") and pending watch notices go out now.
         with contextlib.suppress(Exception):
@@ -3972,6 +4029,18 @@ def record_harness_session_ref(store, session, herdr=None):
     and tell Herdr through pane.report_agent_session so its sidebar and a
     later attach agree with the record. Returns True when something was
     recorded."""
+    # local patch: Herdr reports the pane's current Claude session id, which
+    # is the one anamnesis files are keyed by. Adopted panes have no cwd or
+    # start time to discover it from, and /clear starts a new id mid-pane.
+    rt = session.get("runtime")
+    if herdr is not None and rt and rt.get("agent_id"):
+        with contextlib.suppress(HerdrError, HerdrUnavailable):
+            live = herdr.agent_get(agent_id=rt["agent_id"]) or {}
+            value = (live.get("agent_session") or {}).get("value")
+            if value and value != session["agent"].get("harness_session_ref"):
+                session["agent"]["harness_session_ref"] = value
+                store.save_session(session)
+                return True
     if session["agent"].get("harness_session_ref"):
         return False
     runtime = session.get("runtime")
@@ -4095,6 +4164,51 @@ def herdr_restarted_since_binding(store, session):
     return started >= bound + RESTART_MARGIN_S
 
 
+def is_adopted(store, s):
+    """Local patch: a session that took over a pane someone else started.
+    Its pane belongs to the person, so Keepalive never closes it on its own."""
+    if s.get("adopted"):
+        return True
+    return any(e["type"] == "session.created" and (e.get("data") or {}).get("adopted")
+               for e in store.read_events(s["id"]))
+
+
+def herdr_places(herdr):
+    """Local patch: {pane_id: place} with the workspace and tab each pane
+    sits in, so the panel can mirror Herdr's workspace > tab > pane tree."""
+    try:
+        ws = herdr.call("workspace.list", {}) or {}
+        tabs = herdr.call("tab.list", {}) or {}
+    except (HerdrError, HerdrUnavailable):
+        return None
+    wmap = {w.get("workspace_id"): w for w in ws.get("workspaces", [])}
+    tmap = {t.get("tab_id"): t for t in tabs.get("tabs", [])}
+    def place(workspace_id, tab_id, title=None):
+        w, t = wmap.get(workspace_id) or {}, tmap.get(tab_id) or {}
+        return {"workspace": w.get("label"), "workspace_n": w.get("number"),
+                "tab": t.get("label"), "tab_n": t.get("number"), "title": title}
+    return place
+
+
+def adopted_name(a, place, taken):
+    """The agent's own Herdr name, else its conversation title (cut at a
+    word, 28 chars), else the tab label unless it is only a number, else
+    the workspace label; slugged and unique. The row's detail line shows
+    workspace > tab, so the name says what the conversation is."""
+    tab = (place or {}).get("tab") or ""
+    title = a.get("terminal_title_stripped") or ""
+    base = a.get("name") or title or (tab if tab and not tab.isdigit() else "") or (place or {}).get("workspace") or "claude"
+    slug = derive_herdr_alias(base, "0000")
+    if len(slug) > 28 and not a.get("name"):
+        cut = slug[:28]
+        slug = cut[:cut.rfind("-")] if "-" in cut[8:] else cut
+    name, n = slug, 2
+    while name in taken:
+        name = f"{slug[:29]}-{n}"
+        n += 1
+    return name
+
+
 def sweep_ended_workspaces(ctx, known, live_agents, live_panes):
     """Close the empty shell panes Herdr keeps for sessions that have
     ended or been orphaned. Herdr restores every workspace, with a fresh
@@ -4134,6 +4248,54 @@ def sweep_ended_workspaces(ctx, known, live_agents, live_panes):
     return swept
 
 
+def anamnesis_summary(ref):
+    """Local patch: the anamnesis file for a Claude session id, if any."""
+    if not ref:
+        return None
+    vault = pathlib.Path(os.environ.get("ANAMNESIS_VAULT") or pathlib.Path.home() / "Documents/refuse_to_choose/Claude Sessions")
+    needle = f'session_id: "{ref}"'
+    with contextlib.suppress(OSError):
+        for f in sorted(vault.glob("*/*/*.md"), key=lambda x: x.stat().st_mtime, reverse=True)[:200]:
+            with contextlib.suppress(OSError):
+                with open(f, encoding="utf-8") as fh:
+                    if needle in fh.read(400):
+                        return str(f)
+    return None
+
+
+def closed_with_summary(s):
+    """A close asked from the panel, or a /close-session typed in the pane:
+    either way the agent wrote its anamnesis summary before it went."""
+    return bool(s.get("closing")) or anamnesis_summary(s["agent"].get("harness_session_ref")) is not None
+
+
+CLOSE_PROMPT = ("/close-session (asked from the Keepalive panel): run the whole ritual, save the "
+                "anamnesis summary, and self-close this pane as the very last step.")
+
+
+def cmd_close(args, ctx):
+    """Local patch: the anamnesis way to end a session. The agent itself
+    writes the summary and closes its pane; the record only notes that a
+    close was asked for, so the reconciler reads the vanished pane as
+    `done · closed`, never as orphaned. Claude Code only."""
+    s = ctx.store.load(args.id_or_name)
+    rt = s.get("runtime")
+    if rt is None or s["status"]["state"] in TERMINAL_STATES or s["status"]["state"] in ("orphaned", "paused"):
+        eprint(f"close: {s['name']} has no running agent")
+        return EXIT_USAGE
+    if s["agent"]["kind"] != "claude":
+        eprint("close: /close-session is a Claude Code skill; use stop for other agents")
+        return EXIT_USAGE
+    target = rt.get("agent_id") or derive_herdr_alias(s["name"], s["id"])
+    ctx.herdr.call("agent.prompt", {"target": target, "text": CLOSE_PROMPT})
+    ev = ctx.store.append_event(s["id"], "close.requested", current_human_actor(), {"via": "close-session"})
+    s["closing"] = True
+    s["state_version"] = ev["seq"]
+    ctx.store.save_session(s)
+    print(f"{s['name']}: /close-session sent")
+    return EXIT_OK
+
+
 def cmd_reconcile(args, ctx):
     actor = system_actor()
     known = ctx.store.list_sessions()
@@ -4167,6 +4329,21 @@ def cmd_reconcile(args, ctx):
         raise
     live_agent_ids = {a.get("agent_id") for a in live_agents if a.get("agent_id")}
     live_pane_ids = {p.get("pane_id") for p in live_panes if p.get("pane_id")}
+    place_of = herdr_places(ctx.herdr)
+    if place_of is not None:
+        agent_by_pane = {a.get("pane_id"): a for a in live_agents if a.get("pane_id")}
+        for s in known:
+            rt = s.get("runtime")
+            if rt is None or s["status"]["state"] in TERMINAL_STATES or not rt.get("pane_id"):
+                continue
+            pane = next((p for p in live_panes if p.get("pane_id") == rt["pane_id"]), None)
+            if pane is None:
+                continue
+            title = (agent_by_pane.get(rt["pane_id"]) or {}).get("terminal_title_stripped")
+            new = place_of(pane.get("workspace_id"), pane.get("tab_id"), title)
+            if s.get("herdr_place") != new:
+                s["herdr_place"] = new
+                ctx.store.save_session(s)
 
     orphaned, adopted, ended = [], [], []
     for s in known:
@@ -4194,8 +4371,9 @@ def cmd_reconcile(args, ctx):
             # it is orphaned, never ended (rig, 2026-09-02 22:30: a reboot
             # marked two working sessions failed and Enter opened receipts
             # instead of reviving them).
-            with contextlib.suppress(HerdrError, HerdrUnavailable):
-                ctx.herdr.pane_close(pane_id=pane_id)
+            if not is_adopted(ctx.store, s):
+                with contextlib.suppress(HerdrError, HerdrUnavailable):
+                    ctx.herdr.pane_close(pane_id=pane_id)
             detail = "Herdr restarted; Enter revives"
             ev = ctx.store.append_event(s["id"], "status.changed", actor,
                                          {"from": s["status"]["state"], "to": "orphaned",
@@ -4225,13 +4403,20 @@ def cmd_reconcile(args, ctx):
             # 2026-09-02: `stop` on an ended session leaves panes alone).
             # Pane and worktree first, as `stop` does, so the receipt
             # carries the worktree decision.
-            with contextlib.suppress(HerdrError, HerdrUnavailable):
-                ctx.herdr.pane_close(pane_id=pane_id)
+            if not is_adopted(ctx.store, s):
+                with contextlib.suppress(HerdrError, HerdrUnavailable):
+                    ctx.herdr.pane_close(pane_id=pane_id)
             cleanup_workspace_if_owned(s, ctx.herdr)
-            if s["status"]["state"] == "working":
+            if closed_with_summary(s):
+                _end_session(s, ctx.store, actor, "done", "closed · summary in anamnesis", unbind_reason="closed")
+            elif s["status"]["state"] == "working":
                 _end_session(s, ctx.store, actor, "failed", "harness exited while working", unbind_reason="harness_exited")
             else:
                 _end_session(s, ctx.store, actor, "done", "harness exited", unbind_reason="harness_exited")
+            ended.append(s["id"])
+            continue
+        if not still_present and closed_with_summary(s):
+            _end_session(s, ctx.store, actor, "done", "closed · summary in anamnesis", unbind_reason="closed")
             ended.append(s["id"])
             continue
         if not still_present:
@@ -4262,6 +4447,8 @@ def cmd_reconcile(args, ctx):
     still_unknown = {}
     for a in live_agents:
         agent_id = a.get("agent_id")
+        if not agent_id:
+            agent_id = a.get("pane_id")
         if not agent_id or agent_id in known_agent_ids:
             continue
         stamped = session_by_pane.get(a.get("pane_id"))
@@ -4272,7 +4459,16 @@ def cmd_reconcile(args, ctx):
         if now_ts - first_seen < adopt_grace_seconds():
             continue
         session_id = new_ulid()
-        name = f"herdr-{a.get('name') or agent_id}"
+        place = place_of(a.get("workspace_id"), a.get("tab_id"), a.get("terminal_title_stripped")) if place_of else None
+        taken = {x["name"] for x in ctx.store.list_sessions()} | {x.get("agent_id") for x in live_agents if x.get("agent_id")}
+        taken.discard(a.get("name"))
+        name = adopted_name(a, place, taken)
+        if a.get("name") != name:
+            try:
+                ctx.herdr.agent_rename(target=a.get("pane_id"), name=name)
+            except (HerdrError, HerdrUnavailable):
+                continue
+        agent_id = name
         runtime = {"backend": "herdr", "session": a.get("session"), "workspace_id": a.get("workspace_id"),
                    "tab_id": a.get("tab_id"), "pane_id": a.get("pane_id"), "agent_id": agent_id}
         workspace = {"repo_root": None, "worktree_path": None, "branch": None, "base_branch": None, "created_by_session": False}
@@ -4284,6 +4480,8 @@ def cmd_reconcile(args, ctx):
                                      workspace, cwd=None, command=None)
         ctx.store.append_event(session_id, "session.created", actor, {"name": name, "adopted": True})
         record["state_version"] = 1
+        record["adopted"] = True
+        record["herdr_place"] = place
         ctx.store.save_session(record)
         ev = ctx.store.append_event(session_id, "runtime.bound", actor, runtime)
         record["runtime"] = runtime
@@ -4309,7 +4507,7 @@ COMMAND_HANDLERS = {
     "new": cmd_new, "list": cmd_list, "show": cmd_show, "open": cmd_open,
     "send": cmd_send, "stop": cmd_stop, "rename": cmd_rename, "assign": cmd_assign,
     "goal": cmd_goal, "log": cmd_log, "receipt": cmd_receipt, "history": cmd_history, "capture": cmd_capture,
-    "pause": cmd_pause, "prune": cmd_prune,
+    "pause": cmd_pause, "prune": cmd_prune, "close": cmd_close,
     "artifact-add": cmd_artifact_add, "preview": cmd_preview, "mode": cmd_mode,
     "done": cmd_done, "reconcile": cmd_reconcile,
     "add": cmd_add, "lanes": cmd_lanes, "subscribe": cmd_subscribe, "artifact-mark": cmd_artifact_mark,

@@ -39,6 +39,7 @@ CursorSurface {
   property string fontFamily: Style.font.family
   property double nowMs: Date.now()
   property var formatAge: null        // Panel.formatDuration, one vocabulary for hero and rows
+  property string groupLabel: ""      // local patch: Herdr workspace heading, set on a group's first row
 
   readonly property color dim: Qt.darker(foreground, 1.3) // 4.89:1 on Tokyo Night; 1.55 failed WCAG AA
 
@@ -186,11 +187,12 @@ CursorSurface {
   // Revive is for a session that lost its pane without anyone deciding;
   // Resume is for one a person stopped (03-sessions-panel.md, row actions).
   readonly property string openLabel: revivable ? ((isStopped || isPaused) ? "⏎ Resume" : "⏎ Revive")
-    : (isEnded ? "⏎ Receipt" : (needsAttention ? "⏎ Answer" : "⏎ Open"))
+    : (isEnded ? "⏎ Summary" : (needsAttention ? "⏎ Answer" : "⏎ Open"))
 
   function stopLabel() {
     if (stopping) return "stopping…"
-    if (!stopArmed) return "x Stop"
+    if (!stopArmed) return (agentKind === "claude" && isLive) ? "x Close" : "x Stop"
+    if (agentKind === "claude" && isLive) return "x again: /close-session"
     return "x Confirm stop" + (childCount > 0 ? " (+" + childCount + " child" + (childCount === 1 ? "" : "ren") + ")" : "")
   }
 
@@ -221,6 +223,17 @@ CursorSurface {
     anchors.leftMargin: Style.space(12)
     anchors.rightMargin: Style.space(12)
     spacing: Style.space(3)
+
+    // local patch: the Herdr workspace this group of rows lives in
+    Text {
+      visible: row.groupLabel !== ""
+      textFormat: Text.PlainText
+      text: row.groupLabel
+      color: row.dim
+      font.family: row.fontFamily
+      font.pixelSize: Style.font.caption
+      font.bold: true
+    }
 
     // ---------- line 1: dot, name, state · age ----------
     Item {
@@ -462,7 +475,7 @@ CursorSurface {
       }
       Button {
         visible: row.isEnded && row.revivable
-        text: "r Receipt"
+        text: "r Summary"
         bordered: true
         foreground: row.foreground
         fontFamily: row.fontFamily
