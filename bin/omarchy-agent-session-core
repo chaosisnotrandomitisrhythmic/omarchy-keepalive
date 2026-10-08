@@ -621,7 +621,7 @@ class HerdrUnavailable(Exception):
     on it. A timeout, an empty reply, or a non-JSON line means the server
     is there but slow or confused, and a caller that would take drastic
     action on a dead server (the reconciler orphaning every bound session)
-    must not take it on a slow one (xenolaptop, 2026-10-08: one 5 s
+    must not take it on a slow one (2026-10-08: one 5 s
     timeout while agents were busy unbound seven live sessions)."""
 
     def __init__(self, message, gone=False):
@@ -4186,8 +4186,8 @@ def cmd_reconcile(args, ctx):
         # Only when the socket is really gone, and only once it has been
         # gone for HERDR_GONE_TICKS reconciles in a row: a timeout while
         # the server is busy, or one tick between a server's exit and its
-        # restart, must not unbind every live session (xenolaptop,
-        # 2026-10-08). Until then nothing is written; the index's age
+        # restart, must not unbind every live session (2026-10-08).
+        # Until then nothing is written; the index's age
         # tells the panel the reconciler is not getting through.
         failures = read_herdr_failures() + 1 if e.gone else 0
         write_herdr_failures(failures)

@@ -1648,7 +1648,7 @@ class TestReconcile(CoreTestCase):
         self.assertEqual(index["counts"], {"needs_attention": 1, "live": 1, "orphaned": 1, "paused": 0})
 
     def test_reconcile_orphans_only_on_the_third_tick_without_a_server(self):
-        # xenolaptop, 2026-10-08: a server that is restarting, or one tick
+        # A server that is restarting, or one tick
         # that cannot connect, must not unbind every live session. Two
         # ticks in a row leave the records and the index alone; the third
         # orphans; a tick that gets through resets the count.
