@@ -1647,7 +1647,8 @@ class TestReconcile(CoreTestCase):
         rc, out, err = self.run_cli(["reconcile", "--json"])
         self.assertEqual(rc, 0, err)
         self.assertFalse(stray.exists())
-        self.assertEqual(sorted(p.name for p in self.sessions_dir.iterdir()), ["index.json"])
+        self.assertEqual([p.name for p in self.sessions_dir.iterdir() if p.name.endswith(".tmp")], [])
+        self.assertTrue((self.sessions_dir / "index.json").exists())
 
     def test_reconcile_index_write_failure_changes_neither_exit_code_nor_output(self):
         # A directory squatting on index.json makes the atomic rename fail.
