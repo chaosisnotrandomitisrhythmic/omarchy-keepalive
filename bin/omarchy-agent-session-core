@@ -22,6 +22,7 @@ exact list of assumptions this required.
 import argparse
 import contextlib
 import datetime as dt
+import fcntl
 import getpass
 import json
 import os
@@ -1062,9 +1063,63 @@ def cleanup_workspace_if_owned(session, herdr):
 # Session store
 # --------------------------------------------------------------------------
 
+LOCK_TIMEOUT_S = float(os.environ.get("OMARCHY_SESSIONS_LOCK_TIMEOUT_S", "20"))
+
+
 class SessionStore:
     def __init__(self, root):
         self.root = pathlib.Path(root)
+        self._lock_fd = None
+        self._lock_depth = 0
+
+    def lock_path(self):
+        return self.root / ".lock"
+
+    @contextlib.contextmanager
+    def lock(self, timeout_s=None):
+        """One writer at a time across processes: an exclusive flock on
+        <root>/.lock, held for a load-modify-save. The reconciler (every
+        five seconds, and on every Herdr event) and the panel's commands
+        each read a record, change it and write it back; without this
+        they wrote over each other, and a close's `closing` flag was lost
+        to a reconcile that had loaded the record a moment earlier
+        (xenolaptop, 2026-10-08). Re-entrant within a process. A holder
+        that does not let go within `timeout_s` is reported and the
+        caller goes on without the lock: a stuck command must not stop
+        every other one."""
+        if self._lock_depth:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
+        timeout_s = LOCK_TIMEOUT_S if timeout_s is None else timeout_s
+        fd = None
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self.lock_path()), os.O_RDWR | os.O_CREAT, 0o600)
+            deadline = time.monotonic() + timeout_s
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        eprint(f"sessions store: lock held for over {timeout_s:.0f}s by another command; going on without it")
+                        break
+                    time.sleep(0.05)
+        except OSError as e:
+            eprint(f"sessions store: cannot take {self.lock_path()}: {e}")
+        self._lock_fd, self._lock_depth = fd, 1
+        try:
+            yield
+        finally:
+            self._lock_depth, self._lock_fd = 0, None
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
 
     def session_dir(self, session_id):
         return self.root / session_id
@@ -3341,6 +3396,7 @@ def _send_one(session, args, ctx):
     # done. Herdr's agent list carries `interactive_ready` for exactly
     # this; wait for it, bounded, before typing anything into the pane.
     if not wait_interactive_ready(ctx.herdr, alias):
+        session = ctx.store.try_load(session["id"]) or session
         ev = ctx.store.append_event(session["id"], "instruction.dropped", author,
                                      {"instruction_id": instr["id"], "reason": "agent_not_ready"})
         session["queue"] = [q for q in session["queue"] if q["id"] != instr["id"]]
@@ -3361,6 +3417,7 @@ def _send_one(session, args, ctx):
             prompt_result = {}
             print(f"delivered; wait ran out: {e}", file=sys.stderr)
         else:
+            session = ctx.store.try_load(session["id"]) or session
             ev = ctx.store.append_event(session["id"], "instruction.dropped", author,
                                          {"instruction_id": instr["id"], "reason": "agent_blocked"})
             session["queue"] = [q for q in session["queue"] if q["id"] != instr["id"]]
@@ -3368,6 +3425,9 @@ def _send_one(session, args, ctx):
             ctx.store.save_session(session)
             raise ConflictError(f"instruction dropped: {e}") from e
 
+    # The waits above took seconds; the reconciler may have written the
+    # record since. Carry on from what is on disk, not from the copy.
+    session = ctx.store.try_load(session["id"]) or session
     live_agent = (prompt_result.get("agent") or {}) if isinstance(prompt_result, dict) else {}
     if live_agent.get("agent_status"):
         session = apply_herdr_status(ctx.store, session, live_agent.get("agent_status"))
@@ -4460,12 +4520,18 @@ def sweep_ended_workspaces(ctx, known, live_agents, live_panes):
             events = ctx.store.read_events(s["id"])
             if any(e["type"] == "session.created" and (e.get("data") or {}).get("adopted") for e in events):
                 adopted.add(s["id"])
+    version = {s["id"]: s["state_version"] for s in known}
     swept = []
     for p in live_panes:
         sid = ((p.get("tokens") or {}).get("session_id"))
         if not sid or sid not in ended_ids or sid in adopted:
             continue
         if p.get("workspace_id") in agent_workspaces or not p.get("pane_id"):
+            continue
+        # `known` is a snapshot; a revive since then bound this pane to
+        # the record. Close only what the record on disk still calls ended.
+        current = ctx.store.try_load(sid)
+        if current is None or current["state_version"] != version.get(sid) or current.get("runtime") is not None:
             continue
         try:
             ctx.herdr.pane_close(pane_id=p["pane_id"])
@@ -4529,10 +4595,21 @@ def conversation_closed(session, sessions=None):
     return anamnesis_summary(ref) is not None
 
 
-def closed_with_summary(s):
+def closed_with_summary(store, s):
     """A close asked from the panel, or a /close-session typed in the pane:
-    either way the agent wrote its anamnesis summary before it went."""
-    return bool(s.get("closing")) or anamnesis_summary(s["agent"].get("harness_session_ref")) is not None
+    either way the agent wrote its anamnesis summary before it went. The
+    close is read from the record's flag and from the log: a
+    close.requested event after the latest runtime.bound survives a
+    stale save of the record, which the flag did not (2026-10-08)."""
+    if s.get("closing") or anamnesis_summary(s["agent"].get("harness_session_ref")) is not None:
+        return True
+    closed = False
+    for e in store.read_events(s["id"]):
+        if e.get("type") == "runtime.bound":
+            closed = False
+        elif e.get("type") == "close.requested":
+            closed = True
+    return closed
 
 
 CLOSE_PROMPT = ("/close-session (asked from the Keepalive panel): run the whole ritual, save the "
@@ -4690,7 +4767,7 @@ def cmd_reconcile(args, ctx):
                 with contextlib.suppress(HerdrError, HerdrUnavailable):
                     ctx.herdr.pane_close(pane_id=pane_id)
             cleanup_workspace_if_owned(s, ctx.herdr)
-            if closed_with_summary(s):
+            if closed_with_summary(ctx.store, s):
                 _end_session(s, ctx.store, actor, "done", "closed · summary in anamnesis", unbind_reason="closed")
             elif s["status"]["state"] == "working":
                 _end_session(s, ctx.store, actor, "failed", "harness exited while working", unbind_reason="harness_exited")
@@ -4698,7 +4775,7 @@ def cmd_reconcile(args, ctx):
                 _end_session(s, ctx.store, actor, "done", "harness exited", unbind_reason="harness_exited")
             ended.append(s["id"])
             continue
-        if not still_present and closed_with_summary(s):
+        if not still_present and closed_with_summary(ctx.store, s):
             _end_session(s, ctx.store, actor, "done", "closed · summary in anamnesis", unbind_reason="closed")
             ended.append(s["id"])
             continue
@@ -4820,6 +4897,16 @@ COMMAND_HANDLERS = {
 }
 
 
+# Commands that read, change and write records within a few seconds run
+# under the store lock, the reconciler above all. `new`, `add`, `send` and
+# `accept` wait on the harness for up to a minute and are left out: they
+# re-read the record after each wait instead. Readers never lock.
+LOCKED_COMMANDS = {
+    "reconcile", "open", "close", "stop", "pause", "done", "mode", "rename", "assign", "goal",
+    "visibility", "grant", "subscribe", "artifact-add", "artifact-mark", "preview", "capture", "prune",
+}
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     main_args, extra_args = split_double_dash(argv)
@@ -4843,7 +4930,8 @@ def main(argv=None):
     handler = COMMAND_HANDLERS[args.command]
 
     try:
-        return handler(args, ctx)
+        with (store.lock() if args.command in LOCKED_COMMANDS else contextlib.nullcontext()):
+            return handler(args, ctx)
     except UsageError as e:
         eprint(str(e))
         return e.exit_code
