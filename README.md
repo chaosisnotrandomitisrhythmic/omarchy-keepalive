@@ -45,6 +45,8 @@ omarchy plugin add https://github.com/mphaxise/omarchy-keepalive --enable
 
 The first command clones this repo into `~/.config/omarchy/plugins/io.github.mphaxise.keepalive/` and puts the widget in the bar. The second links the commands into `~/.local/bin/` and installs two user units: one keeps the Herdr server running, one sends the notifications. It needs no root. It will not overwrite a file it did not create. Run it again after `omarchy plugin update`.
 
+It also installs, without enabling, a daily timer that runs `omarchy-agent-session-prune --older-than 14d --yes` at 20:00: ended records older than two weeks go, live, orphaned and paused ones never. Nothing is deleted unless you turn it on, with `OMARCHY_AGENT_SESSIONS_PRUNE=1 ./install.sh` or `systemctl --user enable --now omarchy-agent-session-prune.timer`.
+
 Keybindings are optional. Add these to `~/.config/hypr/bindings.lua` if you want them:
 
 ```lua
@@ -84,7 +86,7 @@ The first command stops and removes the two units and the command links. It keep
 ## What it writes
 
 - Symlinks in `~/.local/bin/`
-- Two unit files in `~/.config/systemd/user/`
+- Four unit files in `~/.config/systemd/user/` (the prune timer is installed but not enabled)
 - Session records in `~/.local/state/omarchy/sessions/`
 - Git worktrees in `~/.herdr/worktrees/`, one per session, each on a `session/<name>` branch
 
