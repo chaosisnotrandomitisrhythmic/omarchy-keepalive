@@ -249,7 +249,8 @@ class TestListJsonShape(CoreTestCase):
             set(entry.keys()),
             {"id", "name", "agent", "status", "owner", "workspace", "needs_attention", "children", "state_version",
              "goal", "mode", "resumable", "revivable", "created_by", "project", "preview", "loop", "lane", "lanes",
-             "visibility", "owner_display", "owned_by_other", "suggestions", "presence"},
+             "visibility", "owner_display", "owned_by_other", "suggestions", "presence",
+             "herdr", "harness_ref"},  # local patch: the Herdr place and the transcript id
         )
         self.assertEqual(set(entry["agent"].keys()), {"kind"})
         self.assertEqual(set(entry["status"].keys()), {"state", "since", "source", "detail"})
