@@ -3000,7 +3000,7 @@ def session_revivable(session, sessions=None):
             or inferred_exit_revivable(session)
             or stop_revivable(session)):
         return False
-    return live_elsewhere(session, sessions) is None
+    return live_elsewhere(session, sessions) is None and not conversation_closed(session, sessions)
 
 
 def restore_worktree_if_missing(session):
@@ -3116,7 +3116,11 @@ def cmd_open(args, ctx):
     state = session["status"]["state"]
     runtime = session.get("runtime")
 
-    if runtime is None and session_revivable(session):
+    if runtime is None and (state in ("orphaned", "paused") or inferred_exit_revivable(session) or stop_revivable(session)):
+        everything = ctx.store.list_sessions()
+        if conversation_closed(session, everything):
+            raise ConflictError(f"session {session['id']}: its conversation was closed out ("
+                                f"{anamnesis_summary(session['agent'].get('harness_session_ref')) or 'ended with a verdict in another record'}); nothing to resume")
         # The conversation may already be running: in a pane the person
         # restarted by hand, or under another record. A second
         # `claude --resume` of it is never what Enter means (xenolaptop,
@@ -4472,19 +4476,57 @@ def sweep_ended_workspaces(ctx, known, live_agents, live_panes):
     return swept
 
 
-def anamnesis_summary(ref):
-    """Local patch: the anamnesis file for a Claude session id, if any."""
-    if not ref:
-        return None
-    vault = pathlib.Path(os.environ.get("ANAMNESIS_VAULT") or pathlib.Path.home() / "Documents/refuse_to_choose/Claude Sessions")
-    needle = f'session_id: "{ref}"'
+_ANAMNESIS_RE = re.compile(r'session_id: "([^"]+)"')
+_ANAMNESIS_CACHE = {}   # vault path -> (read_at, {ref: path})
+ANAMNESIS_CACHE_S = 5.0
+
+
+def anamnesis_vault():
+    return pathlib.Path(os.environ.get("ANAMNESIS_VAULT") or pathlib.Path.home() / "Documents/refuse_to_choose/Claude Sessions")
+
+
+def anamnesis_index():
+    """{Claude session id: summary path} over the newest 200 files of the
+    vault, read once per process (and again after ANAMNESIS_CACHE_S), so
+    `list` asks the question once per run rather than once per record."""
+    vault = anamnesis_vault()
+    cached = _ANAMNESIS_CACHE.get(vault)
+    if cached is not None and time.monotonic() - cached[0] < ANAMNESIS_CACHE_S:
+        return cached[1]
+    index = {}
     with contextlib.suppress(OSError):
         for f in sorted(vault.glob("*/*/*.md"), key=lambda x: x.stat().st_mtime, reverse=True)[:200]:
             with contextlib.suppress(OSError):
                 with open(f, encoding="utf-8") as fh:
-                    if needle in fh.read(400):
-                        return str(f)
-    return None
+                    m = _ANAMNESIS_RE.search(fh.read(400))
+                if m:
+                    index.setdefault(m.group(1), str(f))
+    _ANAMNESIS_CACHE[vault] = (time.monotonic(), index)
+    return index
+
+
+def anamnesis_summary(ref):
+    """Local patch: the anamnesis file for a Claude session id, if any."""
+    if not ref:
+        return None
+    return anamnesis_index().get(ref)
+
+
+def conversation_closed(session, sessions=None):
+    """The conversation this record would resume was closed out: another
+    record on the same ref ended with a verdict or a summary (never the
+    inferred ends, which resume), or its anamnesis summary exists. A
+    revive of it would reopen a conversation that said goodbye
+    (xenolaptop, 2026-10-08)."""
+    ref = session["agent"].get("harness_session_ref")
+    if not ref:
+        return False
+    for other in sessions or ():
+        if other["id"] == session["id"] or other["agent"].get("harness_session_ref") != ref:
+            continue
+        if other["status"]["state"] == "done" and not inferred_exit_revivable(other):
+            return True
+    return anamnesis_summary(ref) is not None
 
 
 def closed_with_summary(s):

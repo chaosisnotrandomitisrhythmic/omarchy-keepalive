@@ -89,6 +89,9 @@ class CoreTestCase(unittest.TestCase):
         # count) is private to the test too, never the desktop's own.
         self.runtime_dir = pathlib.Path(tempfile.mkdtemp(prefix="omarchy-xdg-"))
         os.environ["XDG_RUNTIME_DIR"] = str(self.runtime_dir)
+        # The anamnesis vault (local patch) is private to the test too.
+        self.vault_dir = pathlib.Path(tempfile.mkdtemp(prefix="omarchy-vault-"))
+        os.environ["ANAMNESIS_VAULT"] = str(self.vault_dir)
         self.store = core.SessionStore(self.sessions_dir)
         self.fake_herdr = None
 
@@ -97,7 +100,7 @@ class CoreTestCase(unittest.TestCase):
             self.fake_herdr.stop()
         os.environ.clear()
         os.environ.update(self._old_environ)
-        for d in (self.sessions_dir, self.herdr_dir, self.plain_dir, self.runtime_dir, getattr(self, "worktrees_dir", None)):
+        for d in (self.sessions_dir, self.herdr_dir, self.plain_dir, self.runtime_dir, self.vault_dir, getattr(self, "worktrees_dir", None)):
             if d:
                 shutil.rmtree(d, ignore_errors=True)
         os.environ.pop("HERDR_WORKTREES_DIR", None)
@@ -378,14 +381,16 @@ class TestWindowAndHistory(CoreTestCase):
     def test_list_json_carries_revivable(self):
         # revivable is the core's rule, in one place: orphaned; an inferred
         # end with a transcript; a stop with a transcript. Nothing else.
+        # One conversation per case: records that share a ref answer for
+        # each other (test_open_refuses_a_conversation_closed_out...).
         cases = [
             ("orphan", "orphaned", None, None, True),
             ("orphan-no-ref", "orphaned", "", None, True),
-            ("inferred", "failed", "abc", "harness exited while working", True),
-            ("stopped-with-ref", "stopped", "abc", "stopped", True),
+            ("inferred", "failed", "abc-i", "harness exited while working", True),
+            ("stopped-with-ref", "stopped", "abc-s", "stopped", True),
             ("stopped-no-ref", "stopped", None, "stopped", False),
-            ("done-by-verdict", "done", "abc", "kept", False),
-            ("working", "working", "abc", None, False),
+            ("done-by-verdict", "done", "abc-d", "kept", False),
+            ("working", "working", "abc-w", None, False),
         ]
         for name, state, ref, detail, expected in cases:
             sid = make_bare_session(self.store, name, state=state)
@@ -1089,6 +1094,47 @@ class TestOpen(CoreTestCase):
         self.assertIs(entries["stopped-twin"]["revivable"], False)
         self.assertEqual(entries["stopped-twin"]["live_elsewhere"], live_id)
         self.assertIsNone(entries["live-twin"]["live_elsewhere"])
+
+    def test_open_refuses_a_conversation_closed_out_in_another_record(self):
+        # The same conversation ended with a verdict (or its summary) under
+        # another record; the stopped twin is not a way back into it.
+        self.start_fake_herdr()
+        done_id = make_bare_session(self.store, "closed-twin", runtime=None, state="done")
+        stopped_id = make_bare_session(self.store, "stopped-twin", runtime=None, state="stopped")
+        for sid, detail in ((done_id, "kept"), (stopped_id, "stopped")):
+            record = self.store.try_load(sid)
+            record["agent"]["harness_session_ref"] = "abc123"
+            record["status"]["detail"] = detail
+            self.store.save_session(record)
+        rc, out, err = self.run_cli(["open", stopped_id])
+        self.assertEqual(rc, 5, err)
+        self.assertIn("closed out", err)
+        self.assertEqual(self.fake_herdr.calls("agent.start"), [])
+        entries = {e["name"]: e for e in json.loads(self.run_cli(["list", "--json"])[1])["sessions"]}
+        self.assertIs(entries["stopped-twin"]["revivable"], False)
+
+    def test_open_refuses_a_conversation_with_an_anamnesis_summary(self):
+        self.start_fake_herdr()
+        session_id = make_bare_session(self.store, "orphan-said-goodbye", runtime=None, state="orphaned")
+        record = self.store.try_load(session_id)
+        record["agent"]["harness_session_ref"] = "abc123"
+        self.store.save_session(record)
+        note = self.vault_dir / "2026" / "10" / "2026-10-08-goodbye.md"
+        note.parent.mkdir(parents=True)
+        note.write_text('---\nsession_id: "abc123"\n---\n# Goodbye\n', encoding="utf-8")
+        rc, out, err = self.run_cli(["open", session_id])
+        self.assertEqual(rc, 5, err)
+        self.assertIn(str(note), err)
+        self.assertEqual(self.fake_herdr.calls("agent.start"), [])
+        entries = {e["name"]: e for e in json.loads(self.run_cli(["list", "--json"])[1])["sessions"]}
+        self.assertIs(entries["orphan-said-goodbye"]["revivable"], False)
+        # A different conversation in the same vault is untouched.
+        other_id = make_bare_session(self.store, "orphan-other", runtime=None, state="orphaned")
+        record = self.store.try_load(other_id)
+        record["agent"]["harness_session_ref"] = "def456"
+        self.store.save_session(record)
+        entries = {e["name"]: e for e in json.loads(self.run_cli(["list", "--json"])[1])["sessions"]}
+        self.assertIs(entries["orphan-other"]["revivable"], True)
 
     def test_open_orphaned_without_ref_starts_fresh(self):
         self.start_fake_herdr()
