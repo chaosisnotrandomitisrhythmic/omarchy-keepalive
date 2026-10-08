@@ -1522,6 +1522,36 @@ class TestReconcile(CoreTestCase):
         self.assertEqual(session["runtime"]["agent_id"], "orphan-agent")
         self.assertEqual(session["status"]["state"], "working")
 
+    def test_reconcile_adopts_with_the_conversation_id_herdr_reports(self):
+        # An adopted pane has no cwd or start time to discover a transcript
+        # from; Herdr's agent.list already names the conversation, so the
+        # record carries it from its first tick and a revive resumes it.
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "0"
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [
+            {"name": "stray", "agent": "claude", "pane_id": "p9", "workspace_id": "w9",
+             "agent_session": {"agent": "claude", "kind": "id", "source": "herdr:claude", "value": "conv-123"}}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p9"}]})
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        adopted_id = json.loads(out)["adopted"][0]
+        self.assertEqual(self.store.try_load(adopted_id)["agent"]["harness_session_ref"], "conv-123")
+
+    def test_reconcile_reads_the_conversation_id_from_agent_list_not_agent_get(self):
+        # One agent.list per tick already carries every agent's
+        # agent_session; a further agent.get per bound session was waste.
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [
+            {"name": "a1", "agent": "claude", "pane_id": "p1", "agent_status": "idle",
+             "agent_session": {"kind": "id", "value": "conv-456"}}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p1"}]})
+        runtime = {"backend": "herdr", "session": None, "workspace_id": "w1", "tab_id": "t1", "pane_id": "p1", "agent_id": "a1"}
+        session_id = make_bare_session(self.store, "bound", runtime=runtime, state="working")
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.store.try_load(session_id)["agent"]["harness_session_ref"], "conv-456")
+        self.assertEqual(self.fake_herdr.calls("agent.get"), [])
+
     def test_reconcile_exits_4_when_herdr_unreachable(self):
         # No fake server started -- socket path has nothing listening.
         rc, out, err = self.run_cli(["reconcile"])

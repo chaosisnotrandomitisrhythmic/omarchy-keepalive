@@ -4095,23 +4095,32 @@ def discover_harness_session_ref(kind, cwd, since_epoch, taken=()):
     return candidates[0][1]
 
 
-def record_harness_session_ref(store, session, herdr=None):
+def agent_session_value(agent):
+    """The harness's own conversation id as Herdr reports it on an
+    agent.list / agent.get entry (`agent_session.value`), or None."""
+    return ((agent or {}).get("agent_session") or {}).get("value") or None
+
+
+def record_harness_session_ref(store, session, herdr=None, live=None, sessions=None):
     """Fill agent.harness_session_ref when it is missing and discoverable,
     and tell Herdr through pane.report_agent_session so its sidebar and a
     later attach agree with the record. Returns True when something was
-    recorded."""
+    recorded. `live` is the session's agent.list entry when the caller
+    already holds one (the reconciler lists every agent once per tick, so
+    one agent.get per session on top of that was pure waste); `sessions`
+    is the loaded store for the same reason."""
     # local patch: Herdr reports the pane's current Claude session id, which
     # is the one anamnesis files are keyed by. Adopted panes have no cwd or
     # start time to discover it from, and /clear starts a new id mid-pane.
     rt = session.get("runtime")
-    if herdr is not None and rt and rt.get("agent_id"):
+    if live is None and herdr is not None and rt and rt.get("agent_id"):
         with contextlib.suppress(HerdrError, HerdrUnavailable):
             live = herdr.agent_get(agent_id=rt["agent_id"]) or {}
-            value = (live.get("agent_session") or {}).get("value")
-            if value and value != session["agent"].get("harness_session_ref"):
-                session["agent"]["harness_session_ref"] = value
-                store.save_session(session)
-                return True
+    value = agent_session_value(live)
+    if value and value != session["agent"].get("harness_session_ref"):
+        session["agent"]["harness_session_ref"] = value
+        store.save_session(session)
+        return True
     if session["agent"].get("harness_session_ref"):
         return False
     runtime = session.get("runtime")
@@ -4122,7 +4131,7 @@ def record_harness_session_ref(store, session, herdr=None):
         since = dt.datetime.fromisoformat(session["created_at"].replace("Z", "+00:00")).timestamp()
     except (KeyError, ValueError):
         since = 0
-    taken = {s["agent"].get("harness_session_ref") for s in store.list_sessions()
+    taken = {s["agent"].get("harness_session_ref") for s in (sessions if sessions is not None else store.list_sessions())
              if s["id"] != session["id"] and s["agent"].get("harness_session_ref")}
     ref = discover_harness_session_ref(session["agent"]["kind"], cwd, since, taken=taken)
     if not ref:
@@ -4446,7 +4455,7 @@ def cmd_reconcile(args, ctx):
             live = next((a for a in live_agents if a.get("agent_id") == agent_id), None)
             if live is not None:
                 apply_herdr_status(ctx.store, s, live.get("agent_status"))
-                record_harness_session_ref(ctx.store, s, ctx.herdr)
+                record_harness_session_ref(ctx.store, s, ctx.herdr, live=live, sessions=known)
                 # pattern 06: pending watch notices reach a live watcher on
                 # the next tick, between its turns.
                 if any(q.get("delivery") == "watch" for q in s.get("queue") or []) and (live.get("agent_status") in ("idle", "done")):
@@ -4566,6 +4575,10 @@ def cmd_reconcile(args, ctx):
         # didn't launch -- see README-core.md.
         record = new_session_record(session_id, name, actor, actor, "shared", a.get("kind", "unknown"),
                                      workspace, cwd=None, command=None)
+        # The conversation id Herdr already knows, so the record resumes
+        # the right transcript from its first tick; an adopted pane has no
+        # cwd or start time to discover one from later.
+        record["agent"]["harness_session_ref"] = agent_session_value(a)
         ctx.store.append_event(session_id, "session.created", actor, {"name": name, "adopted": True})
         record["state_version"] = 1
         record["adopted"] = True
