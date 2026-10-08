@@ -236,10 +236,13 @@ Panel {
     consecutiveFailures = 0
   }
 
+  // The list is polled only while the panel is open; closed, the bar icon
+  // and its badge read the reconciler's index.json below, which the
+  // FileView watches, so a closed panel costs no process every ten seconds.
   Timer {
     id: pollTimer
     interval: (root.consecutiveFailures >= 3 ? root.backoffIntervalSec : root.refreshIntervalSec) * 1000
-    running: true
+    running: root.opened
     repeat: true
     triggeredOnStart: true
     onTriggered: root.refresh()
@@ -261,6 +264,7 @@ Panel {
 
   property real indexGeneratedAtMs: 0
   property string herdrState: "unknown" // running | unreachable | unknown
+  property var indexCounts: null        // { needs_attention, live, orphaned, paused } from index.json
 
   function parseIndex(content) {
     try {
@@ -269,12 +273,18 @@ Panel {
       var ms = iso !== "" ? new Date(iso).getTime() : NaN
       root.indexGeneratedAtMs = isFinite(ms) ? ms : 0
       root.herdrState = parsed && parsed.herdr ? String(parsed.herdr) : "unknown"
+      root.indexCounts = (parsed && parsed.counts && typeof parsed.counts === "object") ? parsed.counts : null
     } catch (e) {
       console.warn(root.logTag, "bad index.json", e)
       root.indexGeneratedAtMs = 0
       root.herdrState = "unknown"
+      root.indexCounts = null
     }
   }
+
+  // Closed, the badge and the glyph follow the index, which the
+  // reconciler rewrites every five seconds; open, they follow the list.
+  readonly property bool countsFromIndex: !root.opened && !!root.indexCounts && !root.indexStale
 
   readonly property bool indexStale: indexGeneratedAtMs > 0
     && (nowMs - indexGeneratedAtMs) > (2 * root.refreshIntervalSec * 1000)
@@ -427,9 +437,11 @@ Panel {
   readonly property var visibleRows: needsYouRows.concat(orphanedRows).concat(workingRows).concat(pausedRows).concat(doneShownRows).slice(0, root.maxRows)
 
   // The badge counts every agent that is asking: sessions and their lanes.
-  readonly property int needsAttentionCount: allSessions.reduce(function(n, s) {
-    return n + (s.needs_attention === true ? 1 : 0) + (s.lane_attention_count || 0)
-  }, 0)
+  readonly property int needsAttentionCount: countsFromIndex
+    ? Math.max(0, Number(indexCounts.needs_attention || 0))
+    : allSessions.reduce(function(n, s) {
+        return n + (s.needs_attention === true ? 1 : 0) + (s.lane_attention_count || 0)
+      }, 0)
   readonly property int workingCount: allSessions.filter(function(s) { return s.status && (s.status.state === "working" || s.status.state === "starting") }).length
   readonly property int idleCount: allSessions.filter(function(s) { return s.status && s.status.state === "idle" }).length
   readonly property int pausedCount: pausedRows.length
@@ -438,6 +450,11 @@ Panel {
   // is orphaned (that needs a person too, without the badge); the rest
   // color otherwise. Three honest looks, all at 3:1 or better.
   readonly property string barState: {
+    if (countsFromIndex) {
+      if (Number(indexCounts.needs_attention || 0) > 0) return "needs-you"
+      if (Number(indexCounts.orphaned || 0) > 0) return "orphaned"
+      return "quiet"
+    }
     if (needsYouRows.length > 0) return "needs-you"
     if (orphanedRows.length > 0) return "orphaned"
     return "quiet"
