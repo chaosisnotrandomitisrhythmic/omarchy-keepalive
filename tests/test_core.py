@@ -254,7 +254,8 @@ class TestListJsonShape(CoreTestCase):
             {"id", "name", "agent", "status", "owner", "workspace", "needs_attention", "children", "state_version",
              "goal", "mode", "resumable", "revivable", "created_by", "project", "preview", "loop", "lane", "lanes",
              "visibility", "owner_display", "owned_by_other", "suggestions", "presence",
-             "herdr", "harness_ref"},  # local patch: the Herdr place and the transcript id
+             "herdr", "harness_ref",  # local patch: the Herdr place and the transcript id
+             "live_elsewhere"},
         )
         self.assertEqual(set(entry["agent"].keys()), {"kind"})
         self.assertEqual(set(entry["status"].keys()), {"state", "since", "source", "detail"})
@@ -1040,6 +1041,54 @@ class TestOpen(CoreTestCase):
         self.assertIsNotNone(record["runtime"])
         start_flags = self.fake_herdr.calls("agent.start")[-1]["args"]
         self.assertEqual(start_flags[:2], ["--resume", "abc123"])
+
+    def test_open_rebinds_when_the_conversation_already_runs_unrecorded(self):
+        # The person restarted Claude by hand with --resume; no record holds
+        # that agent. Enter binds the record to it instead of starting a
+        # second --resume of the same conversation.
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [
+            {"name": "claude-code-11", "agent": "claude", "pane_id": "w7:p1", "workspace_id": "w7",
+             "agent_status": "idle", "agent_session": {"kind": "id", "value": "abc123"}}]})
+        self.fake_herdr.set_result("agent.rename", {"type": "ok"})
+        session_id = make_bare_session(self.store, "orphan-live-elsewhere", runtime=None, state="orphaned")
+        record = self.store.try_load(session_id)
+        record["agent"]["harness_session_ref"] = "abc123"
+        self.store.save_session(record)
+        rc, out, err = self.run_cli(["open", session_id])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.fake_herdr.calls("agent.start"), [])
+        record = self.store.try_load(session_id)
+        self.assertEqual(record["status"]["state"], "idle")
+        self.assertEqual(record["runtime"]["pane_id"], "w7:p1")
+        self.assertEqual(record["runtime"]["agent_id"], "orphan-live-elsewhere")
+
+    def test_open_focuses_the_record_that_runs_the_conversation(self):
+        # Two records, one conversation: the stopped twin's Enter goes to
+        # the live one and starts nothing.
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [
+            {"name": "live-twin", "agent": "claude", "pane_id": "p1", "agent_status": "working",
+             "agent_session": {"kind": "id", "value": "abc123"}}]})
+        runtime = {"backend": "herdr", "session": None, "workspace_id": "w1", "tab_id": "t1", "pane_id": "p1", "agent_id": "live-twin"}
+        live_id = make_bare_session(self.store, "live-twin", runtime=runtime, state="working")
+        stopped_id = make_bare_session(self.store, "stopped-twin", runtime=None, state="stopped")
+        for sid in (live_id, stopped_id):
+            record = self.store.try_load(sid)
+            record["agent"]["harness_session_ref"] = "abc123"
+            record["status"]["detail"] = record["status"]["state"]
+            self.store.save_session(record)
+        rc, out, err = self.run_cli(["open", stopped_id])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("already runs as 'live-twin'", out)
+        self.assertEqual(self.fake_herdr.calls("agent.start"), [])
+        self.assertEqual(self.store.try_load(stopped_id)["status"]["state"], "stopped")
+        self.assertIsNone(self.store.try_load(stopped_id)["runtime"])
+        # list says so too: not revivable, and which record runs it.
+        entries = {e["name"]: e for e in json.loads(self.run_cli(["list", "--json"])[1])["sessions"]}
+        self.assertIs(entries["stopped-twin"]["revivable"], False)
+        self.assertEqual(entries["stopped-twin"]["live_elsewhere"], live_id)
+        self.assertIsNone(entries["live-twin"]["live_elsewhere"])
 
     def test_open_orphaned_without_ref_starts_fresh(self):
         self.start_fake_herdr()

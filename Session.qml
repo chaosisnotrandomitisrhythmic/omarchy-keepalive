@@ -148,6 +148,8 @@ CursorSurface {
     if (state === "blocked" || state === "waiting") return "needs you" + (age !== "" ? " · " + age : "")
     if (laneNeedsYou) return attentionLane.lane + " needs you"
     if (hasSuggestion && !needsAttention) return suggester + " suggests"
+    // The conversation runs under another record; Enter focuses that one.
+    if (session && session.live_elsewhere) return state + " · runs elsewhere"
     if (state === "orphaned") return "orphaned · " + (resumable ? "resumes conversation" : "fresh start")
     if (state === "paused") return "paused" + (age !== "" ? " · " + age : "")
     if (isEnded && revivable) return state + " · resumes conversation"

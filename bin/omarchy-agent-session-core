@@ -1898,7 +1898,7 @@ def session_project(s):
     return None
 
 
-def session_list_entry(s):
+def session_list_entry(s, sessions=None):
     status = s["status"]
     viewer = current_human_actor()
     created_by = s.get("created_by") or {}
@@ -1918,8 +1918,10 @@ def session_list_entry(s):
         "mode": s["mode"],
         "resumable": isinstance(ref, str) and bool(ref),
         # Whether `open` brings it back, decided here and nowhere else
-        # (02-command-surface.md, 2026-09-03).
-        "revivable": session_revivable(s),
+        # (02-command-surface.md, 2026-09-03); the record that runs the
+        # same conversation when that is why it does not.
+        "revivable": session_revivable(s, sessions),
+        "live_elsewhere": live_elsewhere(s, sessions),
         "created_by": {"kind": created_by.get("kind"), "label": created_by.get("label")},
         "project": (" › ".join(x for x in ((s.get("herdr_place") or {}).get("workspace"), (s.get("herdr_place") or {}).get("tab")) if x)
                     or session_project(s)),
@@ -2773,7 +2775,7 @@ def cmd_list(args, ctx):
         sessions = [s for s in sessions if in_window(s, cutoff)]
         window = {"ended_within": args.ended_within, "earlier_ended": earlier}
     everything = ctx.store.list_sessions()
-    entries = attach_lane_entries([session_list_entry(s) for s in sessions], everything)
+    entries = attach_lane_entries([session_list_entry(s, everything) for s in sessions], everything)
     if args.json:
         payload = {"sessions": entries}
         if window is not None:
@@ -2809,7 +2811,7 @@ def cmd_show(args, ctx):
         return EXIT_OK
 
     if args.json:
-        entry = session_list_entry(session)
+        entry = session_list_entry(session, ctx.store.list_sessions())
         entry.update({
             "goal": session.get("goal"), "runtime": session.get("runtime"),
             "lineage": session.get("lineage"), "created_at": session["created_at"],
@@ -2970,13 +2972,35 @@ def stop_revivable(session):
             and bool(session["agent"].get("harness_session_ref")))
 
 
-def session_revivable(session):
+def live_elsewhere(session, sessions):
+    """The id of another record, live and bound, on the same conversation
+    (same harness_session_ref): a revive of this one would start a second
+    copy of a conversation already running in another pane (xenolaptop,
+    2026-10-08). None when there is no such record, or no ref."""
+    ref = session["agent"].get("harness_session_ref")
+    if not ref:
+        return None
+    for other in sessions or ():
+        if other["id"] == session["id"] or other["agent"].get("harness_session_ref") != ref:
+            continue
+        if other.get("runtime") is None or other["status"]["state"] in TERMINAL_STATES \
+                or other["status"]["state"] in ("orphaned", "paused"):
+            continue
+        return other["id"]
+    return None
+
+
+def session_revivable(session, sessions=None):
     """True exactly when `open` would bring the session back rather than
     refuse it. Computed here and carried in `list --json` as `revivable`,
-    so no surface re-derives the rule (02-command-surface.md)."""
-    return (session["status"]["state"] in ("orphaned", "paused")
+    so no surface re-derives the rule (02-command-surface.md). With the
+    loaded store, a conversation that runs in another record is not
+    revivable here; `open` on it focuses the one that runs."""
+    if not (session["status"]["state"] in ("orphaned", "paused")
             or inferred_exit_revivable(session)
-            or stop_revivable(session))
+            or stop_revivable(session)):
+        return False
+    return live_elsewhere(session, sessions) is None
 
 
 def restore_worktree_if_missing(session):
@@ -3047,6 +3071,41 @@ def focus_in_herdr_window(herdr, target):
     return True
 
 
+def attach_terminal(session):
+    """A terminal of the session's own on its Herdr agent, detached."""
+    alias = derive_herdr_alias(session["name"], session["id"])
+    with contextlib.suppress(FileNotFoundError, OSError):
+        subprocess.Popen(["omarchy-launch-or-focus-tui", f"--app-id=org.omarchy.session.{session['id']}",
+                          "herdr", "agent", "attach", alias],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+
+def live_agent_for_ref(herdr, ref):
+    """Herdr's agent.list entry whose agent_session.value is `ref`, or
+    None (no ref, no such agent, or Herdr not answering)."""
+    if not ref or herdr is None:
+        return None
+    try:
+        agents = herdr.agent_list()
+    except (HerdrError, HerdrUnavailable):
+        return None
+    return next((a for a in agents if agent_session_value(a) == ref), None)
+
+
+def holder_of_agent(store, agent, exclude_id=None):
+    """The live record bound to this Herdr agent (by agent id or pane),
+    or None."""
+    name, pane_id = agent.get("agent_id") or agent.get("name"), agent.get("pane_id")
+    for s in store.list_sessions():
+        rt = s.get("runtime") or {}
+        if s["id"] == exclude_id or not rt or s["status"]["state"] in TERMINAL_STATES:
+            continue
+        if (name and rt.get("agent_id") == name) or (pane_id and rt.get("pane_id") == pane_id):
+            return s
+    return None
+
+
 def cmd_open(args, ctx):
     session = ctx.store.load(args.id_or_name)
     if getattr(args, "lane", None):
@@ -3056,6 +3115,24 @@ def cmd_open(args, ctx):
     touch_presence(session["id"], actor)
     state = session["status"]["state"]
     runtime = session.get("runtime")
+
+    if runtime is None and session_revivable(session):
+        # The conversation may already be running: in a pane the person
+        # restarted by hand, or under another record. A second
+        # `claude --resume` of it is never what Enter means (xenolaptop,
+        # 2026-10-08); focus the one that runs, binding this record to it
+        # when no record holds it.
+        live = live_agent_for_ref(ctx.herdr, session["agent"].get("harness_session_ref"))
+        if live is not None:
+            holder = holder_of_agent(ctx.store, live, exclude_id=session["id"])
+            if holder is not None:
+                if not focus_in_herdr_window(ctx.herdr, (holder.get("runtime") or {}).get("agent_id") or live.get("name")):
+                    attach_terminal(holder)
+                print(f"{session['name']}: its conversation already runs as '{holder['name']}'; focused that")
+                return EXIT_OK
+            rebind_session(ctx.store, session, live, ctx.herdr, actor, "found running in Herdr; rebound by open")
+            state = session["status"]["state"]
+            runtime = session.get("runtime")
 
     if state == "starting" and runtime is None:
         # Created, never bound: Herdr refused the start (run 10, 2026-09-03).
@@ -3127,11 +3204,7 @@ def cmd_open(args, ctx):
         # the desktop, focus the agent inside it; a terminal of its own is
         # only the fallback for when no Herdr client is open.
         if not focus_in_herdr_window(ctx.herdr, runtime.get("agent_id") or alias):
-            with contextlib.suppress(FileNotFoundError, OSError):
-                subprocess.Popen(["omarchy-launch-or-focus-tui", f"--app-id=org.omarchy.session.{session['id']}",
-                                  "herdr", "agent", "attach", alias],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=True)
+            attach_terminal(session)
         # Instructions queued while the session had no runtime ("delivered
         # on revive") and pending watch notices go out now.
         with contextlib.suppress(Exception):
@@ -3754,10 +3827,11 @@ def cmd_history(args, ctx):
     if args.days < 1:
         raise UsageError("--days wants a positive integer")
     viewer = current_human_actor()
-    groups, ended, earlier = history_days(ctx.store.list_sessions(), args.days, viewer, getattr(args, "all", False))
+    sessions = ctx.store.list_sessions()
+    groups, ended, earlier = history_days(sessions, args.days, viewer, getattr(args, "all", False))
     if args.json:
         print(json.dumps({
-            "days": [{"date": date.isoformat(), "sessions": [session_list_entry(s) for _, s in items]} for date, items in groups],
+            "days": [{"date": date.isoformat(), "sessions": [session_list_entry(s, sessions) for _, s in items]} for date, items in groups],
             "window": {"days": args.days, "ended": ended, "earlier_ended": earlier},
         }, indent=2))
         return EXIT_OK
