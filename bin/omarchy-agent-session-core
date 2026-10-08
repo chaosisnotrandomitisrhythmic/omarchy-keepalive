@@ -4289,6 +4289,76 @@ def adopted_name(a, place, taken):
     return name
 
 
+def revivable_by_ref(sessions):
+    """{harness_session_ref: record} over the records `open` would revive,
+    one per conversation: an orphaned record first, then a paused one,
+    then the newest of the rest (a stop, an inferred exit)."""
+    rank = {"orphaned": 0, "paused": 1}
+    out = {}
+    for s in sessions:
+        ref = s["agent"].get("harness_session_ref")
+        if not ref or s.get("runtime") is not None or not session_revivable(s):
+            continue
+        cur = out.get(ref)
+        key = (rank.get(s["status"]["state"], 2), -_created_ts(s))
+        if cur is None or key < (rank.get(cur["status"]["state"], 2), -_created_ts(cur)):
+            out[ref] = s
+    return out
+
+
+def _created_ts(s):
+    try:
+        return parse_rfc3339(s["created_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def rebind_session(store, session, agent, herdr, actor, detail):
+    """Bind a record that has no runtime to the live Herdr agent that runs
+    its conversation (same agent_session.value as the record's
+    harness_session_ref): the person restarted the harness by hand after
+    a Herdr outage, or a reconcile tick lost the pane and found it again.
+    Before this, such an agent was adopted as a new record while the old
+    one sat orphaned and revivable beside it, and Enter on the old one
+    started a second copy of the same conversation (xenolaptop,
+    2026-10-08). The agent is renamed to the record's alias when Herdr
+    lets it, so send, close and focus find it; the pane is stamped with
+    the session id, as agent.start does. Mutates and saves `session`."""
+    alias = derive_herdr_alias(session["name"], session["id"])
+    agent_id = agent.get("agent_id") or agent.get("name")
+    pane_id = agent.get("pane_id")
+    if herdr is not None and agent.get("name") != alias:
+        with contextlib.suppress(HerdrError, HerdrUnavailable):
+            herdr.agent_rename(target=pane_id or agent_id, name=alias)
+            agent_id = alias
+    if herdr is not None and pane_id:
+        with contextlib.suppress(HerdrError, HerdrUnavailable):
+            herdr.call("pane.report_metadata", {"pane_id": pane_id, "source": "omarchy-agent-session",
+                                               "title": alias, "tokens": {"session_id": session["id"]}})
+    state = session["status"]["state"]
+    if state in TERMINAL_STATES:
+        # The same path `open` takes for a stop or an inferred exit: the
+        # record passes through orphaned, so the log reads the same way.
+        ev = store.append_event(session["id"], "status.changed", actor,
+                                {"from": state, "to": "orphaned", "source": "reconciler", "detail": detail})
+        session["status"] = {"state": "orphaned", "since": ev["ts"], "source": "reconciler", "detail": detail}
+        session["state_version"] = ev["seq"]
+        state = "orphaned"
+    runtime = {"backend": "herdr", "session": agent.get("session"), "workspace_id": agent.get("workspace_id"),
+               "tab_id": agent.get("tab_id"), "pane_id": pane_id, "agent_id": agent_id}
+    ev = store.append_event(session["id"], "runtime.bound", actor, runtime)
+    session["runtime"] = runtime
+    session["state_version"] = ev["seq"]
+    session.pop("closing", None)   # a close asked of the previous binding did not happen
+    new_state = HERDR_STATUS_MAP.get(agent.get("agent_status")) or "working"
+    ev = store.append_event(session["id"], "status.changed", actor,
+                            {"from": state, "to": new_state, "source": "reconciler", "detail": detail})
+    session["status"] = {"state": new_state, "since": ev["ts"], "source": "reconciler", "detail": detail}
+    session["state_version"] = ev["seq"]
+    store.save_session(session)
+    return session
+
+
 def sweep_ended_workspaces(ctx, known, live_agents, live_panes):
     """Close the empty shell panes Herdr keeps for sessions that have
     ended or been orphaned. Herdr restores every workspace, with a fresh
@@ -4528,9 +4598,27 @@ def cmd_reconcile(args, ctx):
             ctx.store.save_session(s)
             orphaned.append(s["id"])
 
+    # An agent no record holds that runs the conversation of a record with
+    # no runtime (restarted by hand after a Herdr outage, above all) is
+    # that record's, not a new one: rebind it, before the sweep can read
+    # the record as ended and before adoption can make a twin of it.
+    known_agent_ids = {(s.get("runtime") or {}).get("agent_id") for s in known if s.get("runtime")}
+    by_ref = revivable_by_ref(known)
+    rebound, rebound_agent_ids = [], set()
+    for a in live_agents:
+        agent_id = a.get("agent_id") or a.get("pane_id")
+        if not agent_id or agent_id in known_agent_ids:
+            continue
+        s = by_ref.pop(agent_session_value(a), None) if by_ref else None
+        if s is None:
+            continue
+        rebind_session(ctx.store, s, a, ctx.herdr, actor, "found running in Herdr; rebound")
+        rebound.append(s["id"])
+        rebound_agent_ids.add(agent_id)
+        known_agent_ids.add(s["runtime"]["agent_id"])
+
     swept = sweep_ended_workspaces(ctx, known, live_agents, live_panes)
 
-    known_agent_ids = {(s.get("runtime") or {}).get("agent_id") for s in known if s.get("runtime")}
     # Adoption waits. `new` starts the harness, stamps the pane with the
     # session id, then binds the record, and a reconcile that lands in
     # between saw an unknown agent and adopted it as a twin of the session
@@ -4546,7 +4634,7 @@ def cmd_reconcile(args, ctx):
         agent_id = a.get("agent_id")
         if not agent_id:
             agent_id = a.get("pane_id")
-        if not agent_id or agent_id in known_agent_ids:
+        if not agent_id or agent_id in known_agent_ids or agent_id in rebound_agent_ids:
             continue
         stamped = session_by_pane.get(a.get("pane_id"))
         if stamped and ctx.store.try_load(stamped) is not None:
@@ -4598,9 +4686,9 @@ def cmd_reconcile(args, ctx):
 
     write_sessions_index(ctx.store, "running", orphaned, adopted)
     if args.json:
-        print(json.dumps({"orphaned": orphaned, "adopted": adopted, "ended": ended, "swept": swept}, indent=2))
+        print(json.dumps({"orphaned": orphaned, "adopted": adopted, "ended": ended, "swept": swept, "rebound": rebound}, indent=2))
     else:
-        print(f"orphaned {len(orphaned)}, adopted {len(adopted)}, ended {len(ended)}, swept {len(swept)}")
+        print(f"orphaned {len(orphaned)}, adopted {len(adopted)}, ended {len(ended)}, swept {len(swept)}, rebound {len(rebound)}")
     return EXIT_OK
 
 
