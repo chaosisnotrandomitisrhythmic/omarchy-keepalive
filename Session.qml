@@ -62,6 +62,11 @@ CursorSurface {
 
   readonly property string sid: session ? String(session.id || "") : ""
   readonly property string sname: session && session.name ? String(session.name) : sid
+  // local patch: the row leads with the session's title (set by the Claude
+  // hook herdr-title.py through `rename --title`), else Claude Code's own
+  // name for the conversation; the name stays the handle commands use.
+  readonly property string displayName: session && session.title ? String(session.title)
+    : (session && session.herdr && session.herdr.title ? String(session.herdr.title) : sname)
   readonly property string agentKind: session && session.agent ? String(session.agent.kind || "") : ""
   readonly property string state: session && session.status ? String(session.status.state || "") : ""
   readonly property string sinceIso: session && session.status ? String(session.status.since || "") : ""
@@ -181,7 +186,9 @@ CursorSurface {
   // (09-closed-loop-surfaces.md section 7).
   readonly property string suggestionText: hasSuggestion ? ("\u201c" + String(suggestions[0].text || "").split("\n")[0] + "\u201d") : ""
   readonly property string presenceText: presence.length > 1 ? (presence.length + " here") : ""
-  readonly property string ownerText: ownedByOther !== "" ? ("owned by " + ownedByOther) : ""
+  // local patch: "omarchy" is the adopter of every pane started in Herdr,
+  // not a person; saying so on each row only pushed the tag out of view.
+  readonly property string ownerText: ownedByOther !== "" && ownedByOther !== "omarchy" ? ("owned by " + ownedByOther) : ""
   readonly property string detailText: [suggestionText, ownerText, loopText, goal !== "" ? goal
     : [project, branch].filter(function(t) { return t !== "" }).join(" · "), presenceText]
     .filter(function(t) { return t !== "" }).join(" · ")
@@ -255,7 +262,7 @@ CursorSurface {
       Text {
         id: nameText
         textFormat: Text.PlainText
-        text: row.sname
+        text: row.displayName
         color: row.foreground
         font.family: row.fontFamily
         font.pixelSize: row.emphasized ? Style.font.subtitle : Style.font.body

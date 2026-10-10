@@ -258,6 +258,7 @@ class TestListJsonShape(CoreTestCase):
              "goal", "mode", "resumable", "revivable", "created_by", "project", "preview", "loop", "lane", "lanes",
              "visibility", "owner_display", "owned_by_other", "suggestions", "presence",
              "herdr", "harness_ref",  # local patch: the Herdr place and the transcript id
+             "title",  # local patch: the display title (rename --title)
              "live_elsewhere"},
         )
         self.assertEqual(set(entry["agent"].keys()), {"kind"})

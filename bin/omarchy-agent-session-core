@@ -802,7 +802,7 @@ class HerdrClient:
         if session_id:
             with contextlib.suppress(HerdrError, HerdrUnavailable):
                 self.call("pane.report_metadata", {"pane_id": pane_id, "source": "omarchy-agent-session",
-                                                   "title": alias, "tokens": {"session_id": session_id}})
+                                                   "tokens": {"session_id": session_id}})
         return {"session": None, "workspace_id": workspace_id or agent.get("workspace_id"),
                 "tab_id": tab_id or agent.get("tab_id"), "pane_id": agent.get("pane_id") or pane_id,
                 "agent_id": agent.get("name") or alias}
@@ -1858,6 +1858,7 @@ def build_parser():
     p = sub.add_parser("rename")
     add_id_arg(p)
     p.add_argument("new_name")
+    p.add_argument("--title", help="local patch: the words the panel shows; the name stays the handle")
 
     p = sub.add_parser("assign")
     add_id_arg(p)
@@ -1978,8 +1979,8 @@ def session_list_entry(s, sessions=None):
         "revivable": session_revivable(s, sessions),
         "live_elsewhere": live_elsewhere(s, sessions),
         "created_by": {"kind": created_by.get("kind"), "label": created_by.get("label")},
-        "project": (" › ".join(x for x in ((s.get("herdr_place") or {}).get("workspace"), (s.get("herdr_place") or {}).get("tab")) if x)
-                    or session_project(s)),
+        "project": herdr_project(s.get("herdr_place"), s.get("title")) or session_project(s),
+        "title": s.get("title"),
         "herdr": s.get("herdr_place"),
         "harness_ref": ref if isinstance(ref, str) else None,
         # 09-closed-loop-surfaces.md section 7: the registered preview and
@@ -3692,11 +3693,16 @@ def cmd_rename(args, ctx):
         raise ConflictError(f"session name '{args.new_name}' is already in use by a live session")
     actor = current_human_actor()
     old_name = session["name"]
-    ev = ctx.store.append_event(session["id"], "session.renamed", actor, {"from": old_name, "to": args.new_name})
+    if args.new_name == old_name and (args.title is None or args.title == session.get("title")):
+        return EXIT_OK
+    ev = ctx.store.append_event(session["id"], "session.renamed", actor,
+                                {"from": old_name, "to": args.new_name, **({"title": args.title} if args.title is not None else {})})
     session["name"] = args.new_name
+    if args.title is not None:
+        session["title"] = args.title or None
     session["state_version"] = ev["seq"]
     ctx.store.save_session(session)
-    if session.get("runtime") is not None:
+    if session.get("runtime") is not None and args.new_name != old_name:
         new_alias = derive_herdr_alias(args.new_name, session["id"])
         ctx.herdr.agent_rename(agent_id=session["runtime"].get("agent_id"), new_alias=new_alias)
     return EXIT_OK
@@ -4401,11 +4407,38 @@ def herdr_places(herdr):
         return None
     wmap = {w.get("workspace_id"): w for w in ws.get("workspaces", [])}
     tmap = {t.get("tab_id"): t for t in tabs.get("tabs", [])}
-    def place(workspace_id, tab_id, title=None):
+    def place(workspace_id, tab_id, title=None, tag=None):
         w, t = wmap.get(workspace_id) or {}, tmap.get(tab_id) or {}
-        return {"workspace": w.get("label"), "workspace_n": w.get("number"),
-                "tab": t.get("label"), "tab_n": t.get("number"), "title": title}
+        out = {"workspace": w.get("label"), "workspace_n": w.get("number"),
+               "tab": t.get("label"), "tab_n": t.get("number"), "title": title}
+        if tag and tag != title:
+            out["tag"] = tag
+        return out
     return place
+
+
+# Local patch: the pane's title slot in Herdr is the session's tag (a card,
+# repo@branch, an area), reported by the Claude hook herdr-title.py; the
+# terminal title is Claude Code's own name for the conversation, which a
+# shell prompt or the bare harness name does not count as.
+GENERIC_TITLES = {"", "claude", "claude code", "codex", "opencode"}
+SHELL_TITLE_RE = re.compile(r"^\S+@\S+:")
+
+
+def meaningful_title(title):
+    t = (title or "").strip()
+    return None if t.lower() in GENERIC_TITLES or SHELL_TITLE_RE.match(t) else t
+
+
+def herdr_project(place, title=None):
+    """The row's second line: workspace › tag, else workspace › tab, each
+    only while it says something the title does not."""
+    p = place or {}
+    titles = {p.get("title"), title} - {None}
+    tab = p.get("tab") or ""
+    second = p.get("tag") or ("" if tab in titles or tab.isdigit() else tab)
+    ws = p.get("workspace") if p.get("workspace") not in titles else None
+    return " › ".join(x for x in (ws, second) if x)
 
 
 def adopted_name(a, place, taken):
@@ -4472,7 +4505,7 @@ def rebind_session(store, session, agent, herdr, actor, detail):
     if herdr is not None and pane_id:
         with contextlib.suppress(HerdrError, HerdrUnavailable):
             herdr.call("pane.report_metadata", {"pane_id": pane_id, "source": "omarchy-agent-session",
-                                               "title": alias, "tokens": {"session_id": session["id"]}})
+                                               "tokens": {"session_id": session["id"]}})
     state = session["status"]["state"]
     if state in TERMINAL_STATES:
         # The same path `open` takes for a stop or an inferred exit: the
@@ -4699,8 +4732,9 @@ def cmd_reconcile(args, ctx):
             pane = next((p for p in live_panes if p.get("pane_id") == rt["pane_id"]), None)
             if pane is None:
                 continue
-            title = (agent_by_pane.get(rt["pane_id"]) or {}).get("terminal_title_stripped")
-            new = place_of(pane.get("workspace_id"), pane.get("tab_id"), title)
+            ag = agent_by_pane.get(rt["pane_id"]) or {}
+            new = place_of(pane.get("workspace_id"), pane.get("tab_id"),
+                           meaningful_title(ag.get("terminal_title_stripped")), ag.get("title"))
             if s.get("herdr_place") != new:
                 s["herdr_place"] = new
                 ctx.store.save_session(s)
