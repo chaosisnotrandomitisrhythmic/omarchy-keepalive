@@ -144,7 +144,9 @@ Panel {
     if (visibleRows.length > 0) selectedId = visibleRows[0].id
     refresh()
     if (panelFlick) panelFlick.contentY = 0
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    // local patch: opened on the New field (Super+Alt+N, right click), the
+    // field takes the keys, so typing or dictation lands there at once.
+    Qt.callLater(function() { (newOpen ? newField : keyCatcher).forceActiveFocus() })
   }
 
   // ------------------------------------------------------------- data
@@ -812,6 +814,7 @@ Panel {
     root.armedStopId = ""
     root.sendOpenId = ""
     root.newOpen = true
+    Qt.callLater(function() { newField.forceActiveFocus() })
   }
 
   function startSession(text) {
@@ -977,7 +980,7 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    focusTarget: root.newOpen ? newField : keyCatcher   // local patch: Super+Alt+N types straight away
     contentWidth: panel.fittedContentWidth(Style.space(400))
     contentHeight: panel.fittedContentHeight(column.implicitHeight + legend.height, Style.space(640))
 
@@ -1193,8 +1196,7 @@ Panel {
                     foreground: root.foreground
                     accent: root.accentColor
                     onAccepted: { root.startSession(text); text = "" }
-                    Keys.onEscapePressed: { root.newOpen = false; root.newAttachments = [] }
-                    Keys.onPressed: function(event) {
+                    Keys.onEscapePressed: { root.newOpen = false; root.newAttachments = []; keyCatcher.forceActiveFocus() }                    Keys.onPressed: function(event) {
                       if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier)) {
                         root.pasteIntoNew(); event.accepted = true
                       } else if (event.key === Qt.Key_Backspace && newField.text === "" && root.newAttachments.length > 0) {
