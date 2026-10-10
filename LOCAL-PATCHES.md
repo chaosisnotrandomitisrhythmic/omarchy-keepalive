@@ -1,13 +1,15 @@
 # Local patches (xenolaptop)
 
 This checkout is upstream `mphaxise/omarchy-keepalive` (remote `origin`) with
-local commits on `main`. They are backed up as branch `xeno/local` on
-`chaosisnotrandomitisrhythmic/omarchy-keepalive` (remote `fork`).
+local commits on `main`. They are backed up on
+`chaosisnotrandomitisrhythmic/omarchy-keepalive` (remote `fork`) as
+`xeno/local-<upstream short sha>`: one branch per upstream base, so a rebase
+never needs a force push. Current: `xeno/local-3dc2935`.
 
 `omarchy plugin update` cannot fast-forward a checkout with local commits, so
 it stops and changes nothing. A new upstream version comes in with
 `scripts/upgrade-from-upstream.sh` instead (fetch, rebase, test, validate,
-reinstall, restart, back up).
+reinstall, restart, back up as a new branch).
 
 ## The stack, oldest first
 

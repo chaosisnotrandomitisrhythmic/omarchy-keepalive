@@ -30,5 +30,8 @@ omarchy-plugin-validate . || { echo "validation fails; back out: git reset --har
 ./install.sh
 systemctl --user restart omarchy-agent-session-watch.service
 omarchy restart shell >/dev/null 2>&1 || true
-git push --quiet --force-with-lease fork main:xeno/local
+# A new branch per upstream base: the rebased stack never needs a force push.
+branch=xeno/local-$(git rev-parse --short origin/main)
+git push --quiet fork "main:$branch"
+echo "backed up as fork/$branch"
 echo "upgraded; local stack:"; git log --oneline origin/main..main
