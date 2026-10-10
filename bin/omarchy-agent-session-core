@@ -1850,6 +1850,10 @@ def build_parser():
     p = sub.add_parser("close", help="local patch: ask the agent to run /close-session (anamnesis summary, self-close)")
     add_id_arg(p)
 
+    p = sub.add_parser("close-focused", help="local patch: /close-session in the Herdr pane on screen; "
+                                             "a second press within a few seconds confirms")
+    p.add_argument("--now", action="store_true", help="skip the second press")
+
     p = sub.add_parser("pause", help="I'll be back: exit the harness, keep the session, resume it later with open")
     add_id_arg(p)
     p.add_argument("--lane", help="pause one lane only")
@@ -4672,6 +4676,65 @@ def cmd_close(args, ctx):
     return EXIT_OK
 
 
+CLOSE_CONFIRM_SECONDS = 4
+
+
+def desktop_notify(title, body="", urgency="normal"):
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(["notify-send", "--app-name=Keepalive", "-u", urgency, "-t", "4000",
+                        "-h", "string:x-canonical-private-synchronous:keepalive-close", title, body],
+                       timeout=3, capture_output=True)
+
+
+def cmd_close_focused(args, ctx):
+    """Local patch: the hotkey for "close the session I am looking at".
+    The active window must be the local Herdr client; its focused pane's
+    record gets the same /close-session `close` sends. The first press
+    names the session in a notification; a second press within
+    CLOSE_CONFIRM_SECONDS sends it, so a stray chord costs nothing."""
+    try:
+        active = json.loads(subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True,
+                                           text=True, timeout=3).stdout or "{}")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        active = {}
+    if not active.get("address") or active.get("address") != herdr_window_address():
+        desktop_notify("No session on screen", "Focus the Herdr window on the session to close.")
+        return EXIT_USAGE
+    agent = next((a for a in ctx.herdr.agent_list() or [] if a.get("focused")), None)
+    if agent is None:
+        desktop_notify("No agent in the focused pane")
+        return EXIT_NOT_FOUND
+    sid = (agent.get("tokens") or {}).get("session_id")
+    s = None
+    for rec in ctx.store.list_sessions():
+        rt = rec.get("runtime") or {}
+        if rec["id"] == sid or (rt.get("pane_id") and rt.get("pane_id") == agent.get("pane_id")
+                                and rec["status"]["state"] not in TERMINAL_STATES):
+            s = rec
+            break
+    if s is None:
+        desktop_notify("Not a Keepalive session", agent.get("name") or agent.get("pane_id") or "")
+        return EXIT_NOT_FOUND
+    label = (s.get("herdr_place") or {}).get("title") or s["name"]
+    marker = ctx.store.root / ".close-armed"
+    try:
+        armed = json.loads(marker.read_text())
+    except (OSError, json.JSONDecodeError):
+        armed = {}
+    now = time.time()
+    if not args.now and not (armed.get("id") == s["id"] and now - float(armed.get("at", 0)) <= CLOSE_CONFIRM_SECONDS):
+        marker.write_text(json.dumps({"id": s["id"], "at": now}))
+        desktop_notify(f"Close \u201c{label}\u201d?", "Press again to run /close-session.")
+        return EXIT_OK
+    with contextlib.suppress(OSError):
+        marker.unlink()
+    args.id_or_name = s["id"]
+    code = cmd_close(args, ctx)
+    if code == EXIT_OK:
+        desktop_notify(f"Closing \u201c{label}\u201d", "It writes its summary, then closes its pane.", "low")
+    return code
+
+
 def cmd_reconcile(args, ctx):
     actor = system_actor()
     remove_stale_tmp_files(ctx.store.root)
@@ -4923,7 +4986,7 @@ COMMAND_HANDLERS = {
     "new": cmd_new, "list": cmd_list, "show": cmd_show, "open": cmd_open,
     "send": cmd_send, "stop": cmd_stop, "rename": cmd_rename, "assign": cmd_assign,
     "goal": cmd_goal, "log": cmd_log, "receipt": cmd_receipt, "history": cmd_history, "capture": cmd_capture,
-    "pause": cmd_pause, "prune": cmd_prune, "close": cmd_close,
+    "pause": cmd_pause, "prune": cmd_prune, "close": cmd_close, "close-focused": cmd_close_focused,
     "artifact-add": cmd_artifact_add, "preview": cmd_preview, "mode": cmd_mode,
     "done": cmd_done, "reconcile": cmd_reconcile,
     "add": cmd_add, "lanes": cmd_lanes, "subscribe": cmd_subscribe, "artifact-mark": cmd_artifact_mark,
@@ -4936,7 +4999,7 @@ COMMAND_HANDLERS = {
 # `accept` wait on the harness for up to a minute and are left out: they
 # re-read the record after each wait instead. Readers never lock.
 LOCKED_COMMANDS = {
-    "reconcile", "open", "close", "stop", "pause", "done", "mode", "rename", "assign", "goal",
+    "reconcile", "open", "close", "close-focused", "stop", "pause", "done", "mode", "rename", "assign", "goal",
     "visibility", "grant", "subscribe", "artifact-add", "artifact-mark", "preview", "capture", "prune",
 }
 
