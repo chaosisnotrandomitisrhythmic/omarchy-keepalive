@@ -74,6 +74,10 @@ Panel {
   property string armedStopId: ""
   property string sendOpenId: ""
   property bool newOpen: false      // the New session field under the hero
+  // local patch: screenshots pasted into the New field (Ctrl+V), kept until
+  // the session starts or Esc cancels, so the panel can close for another
+  // capture and come back with them still attached.
+  property var newAttachments: []
   property string addOpenId: ""     // the Add-an-agent field on a row (11-agent-lanes.md)
   // The lane the cursor is on inside the cursor row: "" is the session's
   // own agent (main); `l` walks the added lanes. Reset on every cursor move.
@@ -812,7 +816,39 @@ Panel {
 
   function startSession(text) {
     var t = String(text || "").trim()
+    if (root.newAttachments.length > 0) {
+      var lines = root.newAttachments.map(function(f) { return "Screenshot: " + f })
+      t = (t !== "" ? t + "\n\n" : "Look at this screenshot.\n\n") + lines.join("\n")
+      root.newAttachments = []
+    }
     root.runAction("new", "new", [scriptPath("new-session.sh"), t, root.newSessionDir, root.newSessionMode], "starting…")
+  }
+
+  // local patch: Ctrl+V in the New field takes an image off the clipboard
+  // (scripts/paste-image.sh saves it); with no image there, it pastes text.
+  function pasteIntoNew() {
+    if (pasteProcess.running) return
+    pasteProcess.command = [scriptPath("paste-image.sh")]
+    pasteProcess.running = true
+  }
+
+  Process {
+    id: pasteProcess
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var path = String(text).trim()
+        if (path !== "") root.newAttachments = root.newAttachments.concat([path])
+        else newField.paste()
+      }
+    }
+  }
+
+  // Super+Ctrl+N and the IPC function: the panel opens on the New field.
+  function openNewSession() {
+    if (root.opened) root.openNew()
+    else { root.openNewNext = true; root.open() }
   }
 
   // Middle click and the IPC function: the session that most recently
@@ -836,6 +872,11 @@ Panel {
   IpcHandler {
     target: root.ipcTarget
     function open(): void { root.open() }
+    function newSession(): void { root.openNewSession() }
+    function newSessionWith(path: string): void {
+      if (path !== "") root.newAttachments = root.newAttachments.concat([path])
+      root.openNewSession()
+    }
     function close(): void { root.close() }
     function show(): void { root.open() }
     function hide(): void { root.close() }
@@ -1152,7 +1193,14 @@ Panel {
                     foreground: root.foreground
                     accent: root.accentColor
                     onAccepted: { root.startSession(text); text = "" }
-                    Keys.onEscapePressed: root.newOpen = false
+                    Keys.onEscapePressed: { root.newOpen = false; root.newAttachments = [] }
+                    Keys.onPressed: function(event) {
+                      if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier)) {
+                        root.pasteIntoNew(); event.accepted = true
+                      } else if (event.key === Qt.Key_Backspace && newField.text === "" && root.newAttachments.length > 0) {
+                        root.newAttachments = root.newAttachments.slice(0, -1); event.accepted = true
+                      }
+                    }
                   }
                   Button {
                     id: startButton
@@ -1162,6 +1210,20 @@ Panel {
                     fontFamily: root.fontFamily
                     onClicked: { root.startSession(newField.text); newField.text = "" }
                   }
+                }
+
+                Text {
+                  visible: root.newOpen
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.newAttachments.length > 0
+                    ? "󰁦  " + root.newAttachments.length + (root.newAttachments.length === 1 ? " screenshot" : " screenshots")
+                      + " · ctrl+v adds · ⌫ drops"
+                    : "ctrl+v pastes a screenshot"
+                  color: root.newAttachments.length > 0 ? root.accentColor : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
                 }
 
                 Text {
