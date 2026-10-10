@@ -1243,10 +1243,9 @@ Panel {
                   visible: root.newOpen
                   width: parent.width
                   textFormat: Text.PlainText
-                  text: root.modelLine + " · " + (root.newAttachments.length > 0
-                    ? "󰁦 " + root.newAttachments.length + (root.newAttachments.length === 1 ? " screenshot" : " screenshots")
-                      + " · ctrl+v adds · ⌫ drops"
-                    : "ctrl+v: screenshot")
+                  text: root.modelLine + (root.newAttachments.length > 0
+                    ? " · 󰁦 " + root.newAttachments.length + (root.newAttachments.length === 1 ? " screenshot" : " screenshots")
+                    : "")
                   color: root.newModel === "fable" || root.newAttachments.length > 0 ? root.accentColor : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
