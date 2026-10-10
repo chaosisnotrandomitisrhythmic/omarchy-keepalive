@@ -2,7 +2,7 @@
 # Start a session from the panel: the default agent, the panel's directory,
 # the typed text as the first prompt, then a terminal on it.
 #
-#   new-session.sh "<prompt, or empty>" [dir] [mode]
+#   new-session.sh "<prompt, or empty>" [dir] [mode] [model]
 #
 # Exit codes: 0 started; 6 no default agent; 7 the directory does not
 # exist; otherwise the exit code of omarchy-agent-session-new or -open
@@ -12,6 +12,7 @@ set -uo pipefail
 text=${1:-}
 dir=${2:-${OMARCHY_AGENT_SESSIONS_NEW_DIR:-$HOME/Work}}
 mode=${3:-personal}
+model=${4:-}   # local patch: empty = the harness's default (opus in ~/.claude/settings.json)
 dir=${dir/#\~/$HOME}
 
 agent=$(omarchy-default-agent 2>/dev/null || true)
@@ -26,6 +27,7 @@ fi
 
 args=(--agent "$agent" --mode "$mode" --cwd "$dir")
 [[ -n $text ]] && args+=(--prompt "$text")
+[[ -n $model ]] && args+=(--model "$model")
 
 id=$(omarchy-agent-session-new "${args[@]}") || exit $?
 omarchy-agent-session-open "$id" || exit $?

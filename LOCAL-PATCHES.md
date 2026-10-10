@@ -29,6 +29,8 @@ reinstall, restart, back up as a new branch).
 | prune: a daily timer | | PR #5 |
 | Session titles | `rename --title`; rows show the title and the tag; adoption leaves the pane's Herdr title (the tag) alone | local only |
 | New session: paste screenshots | Ctrl+V images in the New field; IPC `newSession`, `newSessionWith`; `scripts/capture-new-session.sh` | local only |
+| New field takes the keyboard | Super+Alt+N can be followed by typing or dictation at once | local only |
+| Model choice | `new --model` (kept for a revive); Tab in the New field switches Opus/Fable, with Fable's weekly use from the agents widget; rows name a non-default model | local only |
 | close-focused | /close-session for the Herdr pane on screen, second press confirms | local only |
 
 When upstream merges one of the PRs, its commit drops out of the rebase on

@@ -1739,6 +1739,7 @@ def build_parser():
 
     p = sub.add_parser("new")
     p.add_argument("--agent", required=True)
+    p.add_argument("--model", help="local patch: the harness's model (claude: opus, fable, ...); kept for a revive")
     p.add_argument("--mode", choices=["personal", "shared", "restricted"])
     p.add_argument("--name")
     p.add_argument("--goal")
@@ -1964,7 +1965,8 @@ def session_list_entry(s, sessions=None):
     created_by = s.get("created_by") or {}
     ref = s["agent"].get("harness_session_ref")
     return {
-        "id": s["id"], "name": s["name"], "agent": {"kind": s["agent"]["kind"]},
+        "id": s["id"], "name": s["name"],
+        "agent": {"kind": s["agent"]["kind"], **({"model": s["agent"]["model"]} if s["agent"].get("model") else {})},
         "status": {"state": status["state"], "since": status["since"],
                    "source": status.get("source"), "detail": status.get("detail")},
         "owner": s["owner"]["actor"],
@@ -2067,6 +2069,8 @@ def cmd_new(args, ctx):
     # Validate the harness/mode combination and the deny-list before
     # creating anything on disk (extra agent args count toward invariant 5).
     extra_args = list(getattr(args, "extra_args", []) or [])
+    if getattr(args, "model", None):
+        extra_args += ["--model", args.model]
     argv, env, cell = assemble_launch(kind, mode, extra_args)
 
     session_id = new_ulid()
@@ -2080,7 +2084,10 @@ def cmd_new(args, ctx):
         session_id, name, created_by, owner, mode, kind, workspace, cwd, command_str,
         goal_text=args.goal, parent_id=args.from_session, spawn_reason="agent_spawn" if args.from_session else None,
     )
-    ctx.store.append_event(session_id, "session.created", created_by, {"name": name, "agent": {"kind": kind}, "mode": mode})
+    if getattr(args, "model", None):
+        record["agent"]["model"] = args.model
+    ctx.store.append_event(session_id, "session.created", created_by,
+                           {"name": name, "agent": {k: v for k, v in record["agent"].items() if k in ("kind", "model")}, "mode": mode})
     record["state_version"] = 1
     ctx.store.save_session(record)
 
@@ -3234,7 +3241,8 @@ def cmd_open(args, ctx):
         # no pane, a transcript to resume, the worktree still there.
         ref = session["agent"].get("harness_session_ref")
         worktree_path = (session.get("workspace") or {}).get("worktree_path")
-        argv, env, _cell = assemble_launch(session["agent"]["kind"], session["mode"])
+        model = session["agent"].get("model")
+        argv, env, _cell = assemble_launch(session["agent"]["kind"], session["mode"], ["--model", model] if model else [])
         detail = None
         if ref:
             argv = list(RESUME_FLAGS.get(session["agent"]["kind"], ["--resume"])) + [ref] + argv

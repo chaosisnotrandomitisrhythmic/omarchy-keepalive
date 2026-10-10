@@ -78,6 +78,26 @@ Panel {
   // the session starts or Esc cancels, so the panel can close for another
   // capture and come back with them still attached.
   property var newAttachments: []
+  // local patch: the model a new session starts on. Opus by default (Fable
+  // runs out); Tab in the New field switches, and the line under the field
+  // says how much of Fable's week is used, from the agents widget's record.
+  property string newModel: "opus"
+  property real fableUsed: -1
+  readonly property string fableText: "Fable" + (fableUsed >= 0 ? " " + Math.round(fableUsed * 100) + "%" : "")
+  readonly property string modelLine: newModel === "fable" ? fableText + " · tab: Opus" : "Opus · tab: " + fableText
+  FileView {
+    path: Quickshell.env("HOME") + "/.local/state/omarchy/agents/usage/claude.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      try {
+        var limits = JSON.parse(text()).limits || []
+        var f = limits.filter(function(l) { return /fable/i.test(String(l.label || l.title || "")) })[0]
+        root.fableUsed = f ? Number(f.percent) : -1
+      } catch (e) { root.fableUsed = -1 }
+    }
+  }
   property string addOpenId: ""     // the Add-an-agent field on a row (11-agent-lanes.md)
   // The lane the cursor is on inside the cursor row: "" is the session's
   // own agent (main); `l` walks the added lanes. Reset on every cursor move.
@@ -824,7 +844,9 @@ Panel {
       t = (t !== "" ? t + "\n\n" : "Look at this screenshot.\n\n") + lines.join("\n")
       root.newAttachments = []
     }
-    root.runAction("new", "new", [scriptPath("new-session.sh"), t, root.newSessionDir, root.newSessionMode], "starting…")
+    root.runAction("new", "new", [scriptPath("new-session.sh"), t, root.newSessionDir, root.newSessionMode,
+                                  root.newModel === "opus" ? "" : root.newModel], "starting…")
+    root.newModel = "opus"
   }
 
   // local patch: Ctrl+V in the New field takes an image off the clipboard
@@ -1196,8 +1218,11 @@ Panel {
                     foreground: root.foreground
                     accent: root.accentColor
                     onAccepted: { root.startSession(text); text = "" }
-                    Keys.onEscapePressed: { root.newOpen = false; root.newAttachments = []; keyCatcher.forceActiveFocus() }                    Keys.onPressed: function(event) {
-                      if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier)) {
+                    Keys.onEscapePressed: { root.newOpen = false; root.newAttachments = []; keyCatcher.forceActiveFocus() }
+                    Keys.onPressed: function(event) {
+                      if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+                        root.newModel = root.newModel === "fable" ? "opus" : "fable"; event.accepted = true
+                      } else if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier)) {
                         root.pasteIntoNew(); event.accepted = true
                       } else if (event.key === Qt.Key_Backspace && newField.text === "" && root.newAttachments.length > 0) {
                         root.newAttachments = root.newAttachments.slice(0, -1); event.accepted = true
@@ -1218,11 +1243,11 @@ Panel {
                   visible: root.newOpen
                   width: parent.width
                   textFormat: Text.PlainText
-                  text: root.newAttachments.length > 0
-                    ? "󰁦  " + root.newAttachments.length + (root.newAttachments.length === 1 ? " screenshot" : " screenshots")
+                  text: root.modelLine + " · " + (root.newAttachments.length > 0
+                    ? "󰁦 " + root.newAttachments.length + (root.newAttachments.length === 1 ? " screenshot" : " screenshots")
                       + " · ctrl+v adds · ⌫ drops"
-                    : "ctrl+v pastes a screenshot"
-                  color: root.newAttachments.length > 0 ? root.accentColor : root.dim
+                    : "ctrl+v: screenshot")
+                  color: root.newModel === "fable" || root.newAttachments.length > 0 ? root.accentColor : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight

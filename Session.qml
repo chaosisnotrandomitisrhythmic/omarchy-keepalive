@@ -346,7 +346,9 @@ CursorSurface {
         textFormat: Text.PlainText
         // Personal runs with the harness's no-prompt flags; that is the
         // fact a person most needs to see at a glance, so it never hides.
-        text: row.mode !== "" ? row.mode : row.agentKind
+        // local patch: a session started on another model than the default says so
+        text: (session && session.agent && session.agent.model ? session.agent.model + " · " : "")
+          + (row.mode !== "" ? row.mode : row.agentKind)
         color: row.mode === "shared" || row.mode === "restricted" ? row.accent : row.dim
         font.family: row.fontFamily
         font.pixelSize: Style.font.caption
