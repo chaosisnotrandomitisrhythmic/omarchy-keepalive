@@ -727,6 +727,29 @@ class TestReconcilePacer(unittest.TestCase):
         self.assertFalse(pacer.due(110.1, nudged=False))
 
 
+class TestNudgeFilter(unittest.TestCase):
+    def line(self, **event):
+        return json.dumps({"event": event}).encode()
+
+    def test_only_a_changed_agent_status_is_a_nudge(self):
+        f = watch.NudgeFilter()
+        self.assertTrue(f.is_nudge(self.line(type="pane.updated", pane={"pane_id": "w1:p1", "agent_status": "working"})))
+        self.assertFalse(f.is_nudge(self.line(type="pane.updated", pane={"pane_id": "w1:p1", "agent_status": "working"})))
+        self.assertTrue(f.is_nudge(self.line(type="pane.updated", pane={"pane_id": "w1:p1", "agent_status": "blocked"})))
+        self.assertTrue(f.is_nudge(self.line(type="pane.updated", pane={"pane_id": "w2:p1", "agent_status": "blocked"})))
+
+    def test_what_it_cannot_read_is_a_nudge(self):
+        f = watch.NudgeFilter()
+        self.assertTrue(f.is_nudge(b"not json"))
+        self.assertTrue(f.is_nudge(self.line(type="pane.closed", pane_id="w1:p1")))
+        self.assertTrue(f.is_nudge(self.line(type="pane.updated", pane={"pane_id": "w1:p1"})))
+        self.assertTrue(f.is_nudge(self.line(type="pane.updated", pane={"pane_id": "w1:p1"})))
+
+    def test_the_subscription_acknowledgement_is_not_a_nudge(self):
+        f = watch.NudgeFilter()
+        self.assertFalse(f.is_nudge(b'{"id":"x","result":{"type":"subscription_started"}}'))
+
+
 class TestDryRunPrintsArgv(WatchTestCase):
 
     def test_dry_run_prints_the_argv_instead_of_calling_the_real_binary(self):

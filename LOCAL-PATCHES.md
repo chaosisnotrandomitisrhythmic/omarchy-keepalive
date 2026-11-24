@@ -32,6 +32,7 @@ reinstall, restart, back up as a new branch).
 | New field takes the keyboard | Super+Alt+N can be followed by typing or dictation at once | local only |
 | Model choice | `new --model` (kept for a revive); Tab in the New field switches Opus/Fable, with Fable's weekly use from the agents widget; rows name a non-default model | local only |
 | close-focused | /close-session for the Herdr pane on screen, second press confirms | local only |
+| watch: reconcile on status changes | Herdr `pane.updated` lines nudge only when a pane's `agent_status` changed (`NudgeFilter`); the timed reconcile is a 60 s safety pass, was 5 s | local only |
 
 When upstream merges one of the PRs, its commit drops out of the rebase on
 its own (or resolves as empty: `git rebase --skip`).

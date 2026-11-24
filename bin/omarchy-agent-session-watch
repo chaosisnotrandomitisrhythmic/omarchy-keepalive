@@ -752,6 +752,53 @@ class SessionWatcher:
 # --- optional Herdr events.subscribe nudge --------------------------------
 
 
+def _find_key(obj, key):
+    """First value stored under `key` anywhere in a decoded JSON value."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        obj = list(obj.values())
+    if isinstance(obj, list):
+        for value in obj:
+            found = _find_key(value, key)
+            if found is not None:
+                return found
+    return None
+
+
+class NudgeFilter:
+    """Which lines of the Herdr event stream are worth a reconcile.
+    pane.updated is the only status event Herdr 0.9.1 gives without a
+    pane_id (pane.agent_status_changed needs one per pane), and it also
+    fires on title and output flickers. Only a line whose pane shows a
+    different agent_status than the last line for that pane is a nudge.
+    Anything this cannot read (another event type, no pane_id, no
+    agent_status, not JSON) is a nudge too, so a wrong guess about the
+    shape costs CPU, never a missed change. One filter per connection: a
+    reconnect starts empty and so nudges once per pane."""
+
+    def __init__(self):
+        self._status = {}
+
+    def is_nudge(self, line: bytes) -> bool:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            return True
+        if isinstance(msg, dict) and "result" in msg and "event" not in msg:
+            return False  # the subscription_started acknowledgement
+        if _find_key(msg, "type") != "pane.updated":
+            return True
+        pane_id = _find_key(msg, "pane_id")
+        status = _find_key(msg, "agent_status")
+        if pane_id is None or status is None:
+            return True
+        if self._status.get(pane_id) == status:
+            return False
+        self._status[pane_id] = status
+        return True
+
+
 def herdr_nudge_thread(wake_event: threading.Event, stop_event: threading.Event) -> None:
     """Best-effort low-latency wake-up: connects to the Herdr socket and
     sets wake_event whenever a line arrives, without reading or acting on its
@@ -798,6 +845,7 @@ def herdr_nudge_thread(wake_event: threading.Event, stop_event: threading.Event)
                     }
                 )
                 sock.sendall((subscribe_msg + "\n").encode("utf-8"))
+                nudge_filter = NudgeFilter()
                 buf = b""
                 backoff = 1.0
                 while not stop_event.is_set():
@@ -809,8 +857,9 @@ def herdr_nudge_thread(wake_event: threading.Event, stop_event: threading.Event)
                         break
                     buf += chunk
                     while b"\n" in buf:
-                        _line, buf = buf.split(b"\n", 1)
-                        wake_event.set()
+                        line, buf = buf.split(b"\n", 1)
+                        if nudge_filter.is_nudge(line):
+                            wake_event.set()
         except Exception as exc:
             print(
                 f"omarchy-agent-session-watch: Herdr subscription unavailable ({exc}); "
@@ -823,13 +872,17 @@ def herdr_nudge_thread(wake_event: threading.Event, stop_event: threading.Event)
 
 # --- reconcile pacing --------------------------------------------------
 
-RECONCILE_EVERY_S = 5.0
+# The floor is a safety pass, not the main path: status changes arrive as
+# Herdr nudges (NudgeFilter). At 5 s it was a fresh Python process over the
+# whole store every five seconds, about a tenth of a core all day
+# (xenolaptop, 2026-11-24).
+RECONCILE_EVERY_S = 60.0
 RECONCILE_DEBOUNCE_S = 2.0
 
 
 class ReconcilePacer:
     """When the run loop should run `reconcile`: at least every `every`
-    seconds, and on a Herdr nudge, but never twice within `debounce`
+    seconds (the safety pass), and on a Herdr nudge, but never twice within `debounce`
     seconds. Herdr sends pane.updated on every status flicker, which with
     agents working meant a reconcile a second, each one a full pass over
     the store and three Herdr calls (xenolaptop, 2026-10-08). A nudge
